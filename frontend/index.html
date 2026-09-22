@@ -51,6 +51,48 @@
     </div>
   </section>
 
+  <section class="panel" id="timecode-panel">
+    <div class="panel-head">
+      <h2>Timecode (MTC) on the network</h2>
+      <div class="tc-head-right">
+        <label class="tc-pref" for="tc-pref-ip">
+          <span>Preferred master</span>
+          <input id="tc-pref-ip" class="mono" type="text" inputmode="decimal" size="15"
+                 placeholder="any (auto)" autocomplete="off" spellcheck="false"
+                 title="IP of the timecode master to headline. Not a lock: if it goes quiet the clock falls back to another source, and returns when it's back.">
+          <span class="tc-pref-msg" id="tc-pref-msg"></span>
+        </label>
+        <span class="hint" id="tc-listeners">listening…</span>
+      </div>
+    </div>
+    <div class="tc-hero">
+      <div class="tc-clock mono" id="tc-clock">--:--:--:--</div>
+      <div class="tc-hero-meta">
+        <div class="tc-source" id="tc-source">No timecode seen yet</div>
+        <div class="tc-detail" id="tc-detail">Start your timecode master — Art-Net timecode and ipMIDI appear here automatically.</div>
+        <div class="tc-state">
+          <span class="led" id="tc-led"></span>
+          <span id="tc-state-text">no signal</span>
+        </div>
+      </div>
+    </div>
+    <table class="data-table" id="tc-table">
+      <thead>
+        <tr>
+          <th>Source</th><th>IP address</th><th>Transport</th><th>Timecode</th>
+          <th>Rate</th><th>Format</th><th>Updates</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="empty-row"><td colspan="8">No MTC on the wire yet.</td></tr>
+      </tbody>
+    </table>
+    <div class="tc-endpoints">
+      <span class="tc-endpoints-label">Network-MIDI sessions announced:</span>
+      <span id="midi-endpoints" class="chip-row"><span class="hint">none heard yet</span></span>
+    </div>
+  </section>
+
   <section class="panel" id="universes-panel">
     <div class="panel-head">
       <h2>DMX universes on the wire</h2>
@@ -86,7 +128,7 @@
 </main>
 
 <footer>
-  Passive monitor — sends only ArtPoll discovery and pings, never DMX. Safe to run during a show alongside your console.
+  Passive monitor — sends only ArtPoll discovery and pings, never DMX or MIDI. Safe to run during a show alongside your console.
 </footer>
 
 <script src="/static/app.js"></script>
