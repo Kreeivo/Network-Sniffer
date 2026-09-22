@@ -208,6 +208,7 @@ h2 { font-size: 14px; font-weight: 650; margin: 0; }
   display: flex; flex-direction: column; align-items: flex-end; gap: 4px;
   min-width: 0;
 }
+.tc-settings { display: flex; flex-wrap: wrap; gap: 6px 14px; justify-content: flex-end; }
 .tc-pref {
   display: flex; align-items: center; gap: 7px;
   font-size: 11.5px; color: var(--text-dim);
@@ -221,6 +222,8 @@ h2 { font-size: 14px; font-weight: 650; margin: 0; }
   padding: 2px 7px;
   width: 132px;
 }
+.tc-pref input.short { width: 56px; -moz-appearance: textfield; }
+.tc-pref input.short::-webkit-inner-spin-button { opacity: .6; }
 .tc-pref input:focus { outline: none; border-color: var(--violet); }
 .tc-pref input.bad { border-color: var(--red); }
 .tc-pref-msg { font-size: 11px; min-width: 0; white-space: nowrap; }
@@ -261,6 +264,14 @@ h2 { font-size: 14px; font-weight: 650; margin: 0; }
   text-shadow: 0 0 14px rgba(181,140,255,.45);
 }
 .tc-hero.holding .tc-clock { color: var(--amber); }
+.tc-hero.lost .tc-clock { color: var(--red); opacity: .8; }
+.tc-hero.lost .tc-state .led { background: var(--red); box-shadow: 0 0 7px 1px rgba(242,109,109,.6); }
+.tc-hero.lost .tc-state { color: var(--text); }
+#tc-table tr.lead td { background: rgba(181,140,255,.06); }
+.tag.lead { border-color: rgba(181,140,255,.9); background: rgba(181,140,255,.15); }
+.rate-flag { color: var(--text-dim); }
+.rate-bad { color: var(--amber); }
+.pill.lost { background: var(--red); box-shadow: 0 0 5px rgba(242,109,109,.55); }
 .tc-hero-meta { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .tc-source { font-weight: 650; font-size: 14px; }
 .tc-detail { color: var(--text-dim); font-size: 12px; }

@@ -216,8 +216,11 @@ def advance_timecode(tc: Tuple[int, int, int, int], frames: int,
     return (total % 24, m, s, f)
 
 
-def _valid_tc(h: int, m: int, s: int, f: int, nominal: int) -> bool:
-    return h <= 23 and m <= 59 and s <= 59 and f < nominal
+def _valid_tc(h: int, m: int, s: int, f: int) -> bool:
+    # Any legal frame number is accepted whatever the sender's rate flag
+    # claims - the real rate is worked out from the numbers (RateDetector),
+    # so a master with a wrong flag is still displayed.
+    return h <= 23 and m <= 59 and s <= 59 and f <= 29
 
 
 def parse_art_timecode(data: bytes) -> Optional[dict]:
@@ -226,11 +229,87 @@ def parse_art_timecode(data: bytes) -> Optional[dict]:
     if len(b) < 9:
         return None
     frames, seconds, minutes, hours = b[4], b[5], b[6], b[7]
-    label, nominal = MTC_RATES.get(b[8] & 0x03, ("unknown rate", 30))
-    if not _valid_tc(hours, minutes, seconds, frames, nominal):
+    if not _valid_tc(hours, minutes, seconds, frames):
         return None
-    return {"tc": (hours, minutes, seconds, frames), "rate": label,
-            "nominal": nominal, "kind": "Art-Net timecode"}
+    return {"tc": (hours, minutes, seconds, frames), "rate_code": b[8] & 0x03,
+            "offset": 0, "kind": "Art-Net timecode"}
+
+
+class RateDetector:
+    """Works out the real frame rate of a timecode stream from the numbers
+    on it, independently of what the sender's rate flag claims.
+
+    * Family (24 / 25 / 30) from the highest frame number seen over a few
+      seconds of rolling. Quarter-frame MTC only yields every other frame,
+      so at 30 fps the top is 28 and at 25 fps it takes two seconds to see
+      24 - hence the settling time before a verdict.
+    * Drop-frame vs non-drop (30 family only) from the first frame number
+      after a non-tenth minute boundary: drop-frame skips 00 and 01 there.
+    * Measured speed in frames per wall-clock second, for the display.
+    """
+    WINDOW = 3.0            # seconds of history kept
+    SETTLE = 2.2            # rolling time needed before naming a family
+
+    __slots__ = ("samples", "family", "drop", "prev", "measured")
+
+    def __init__(self):
+        self.samples: Deque[Tuple[float, Tuple[int, int, int, int]]] = deque()
+        self.family = 0                     # 0 = not determined yet
+        self.drop: Optional[bool] = None    # None = no evidence yet
+        self.prev: Optional[Tuple[float, Tuple[int, int, int, int]]] = None
+        self.measured = 0.0
+
+    def add(self, t: float, tc: Tuple[int, int, int, int]):
+        if self.prev and self.prev[1] == tc:
+            return                          # parked: nothing to learn
+        h, m, s, f = tc
+        if s == 0 and m % 10 != 0 and self.prev is not None:
+            ph, pm, ps, pf = self.prev[1]
+            # Only trust the boundary if we saw the end of the previous
+            # minute, so a gap in reception can't masquerade as a drop.
+            if ps == 59 and pf >= 26 and t - self.prev[0] < 0.5:
+                self.drop = f >= 2
+        self.prev = (t, tc)
+        self.samples.append((t, tc))
+        while self.samples and t - self.samples[0][0] > self.WINDOW:
+            self.samples.popleft()
+        t0, first = self.samples[0]
+        if t - t0 >= self.SETTLE:
+            top = max(x[1][3] for x in self.samples)
+            family = 30 if top >= 25 else 25 if top == 24 else 24
+            if self.family and family != self.family:
+                self.drop = None            # rate really changed: re-learn drop
+            self.family = family
+        if self.family and t - t0 >= 0.5:
+            n = self.family
+            span = (_frames(tc, n) - _frames(first, n)) % (24 * 3600 * n)
+            self.measured = span / (t - t0)
+
+    def label(self, rate_code: int) -> Tuple[str, bool, str]:
+        """(display label, True if measured rather than from the flag, note)."""
+        flagged = MTC_RATES[rate_code][0]
+        if self.family == 24:
+            return "24 fps", True, ""
+        if self.family == 25:
+            return "25 fps", True, ""
+        if self.family == 30:
+            if self.drop is True:
+                return "29.97 fps drop", True, ""
+            if self.drop is False:
+                return "30 fps", True, ""
+            # 30-family measured; drop-frame can only be proven at a minute
+            # boundary, so until one rolls by the flag decides that part.
+            return ((flagged if rate_code in (2, 3) else "30 fps"), True,
+                    "30 fps measured; drop-frame per the sender's flag until a minute boundary rolls by")
+        return flagged, False, ""
+
+    def nominal(self, rate_code: int) -> int:
+        return self.family or MTC_RATES[rate_code][1]
+
+
+def _frames(tc: Tuple[int, int, int, int], nominal: int) -> int:
+    h, m, s, f = tc
+    return (((h * 60 + m) * 60) + s) * nominal + f
 
 
 class MidiTimecodeDecoder:
@@ -310,13 +389,13 @@ class MidiTimecodeDecoder:
         seconds = n[2] | (n[3] << 4)
         minutes = n[4] | (n[5] << 4)
         hours = n[6] | ((n[7] & 0x01) << 4)
-        label, nominal = MTC_RATES[(n[7] >> 1) & 0x03]
-        if not _valid_tc(hours, minutes, seconds, frames, nominal):
+        if not _valid_tc(hours, minutes, seconds, frames):
             return None
         # The eight messages span two frames and carry the time of the first,
-        # so a reader displays the value two frames later.
-        tc = advance_timecode((hours, minutes, seconds, frames), 2, nominal)
-        return {"tc": tc, "rate": label, "nominal": nominal,
+        # so a reader displays the value two frames later (offset applied by
+        # the engine once it knows the real frame rate).
+        return {"tc": (hours, minutes, seconds, frames),
+                "rate_code": (n[7] >> 1) & 0x03, "offset": 2,
                 "kind": "MTC quarter-frame"}
 
     @staticmethod
@@ -325,11 +404,11 @@ class MidiTimecodeDecoder:
         if len(body) < 8 or body[0] != 0x7F or body[2:4] != b"\x01\x01":
             return None
         hours, minutes, seconds, frames = body[4] & 0x1F, body[5], body[6], body[7]
-        label, nominal = MTC_RATES.get((body[4] >> 5) & 0x03, ("unknown rate", 30))
-        if not _valid_tc(hours, minutes, seconds, frames, nominal):
+        if not _valid_tc(hours, minutes, seconds, frames):
             return None
-        return {"tc": (hours, minutes, seconds, frames), "rate": label,
-                "nominal": nominal, "kind": "MTC full-frame"}
+        return {"tc": (hours, minutes, seconds, frames),
+                "rate_code": (body[4] >> 5) & 0x03, "offset": 0,
+                "kind": "MTC full-frame"}
 
 
 def _vlq(buf: bytes, i: int) -> int:
@@ -562,7 +641,16 @@ class TimecodeSource:
     port: int
     name: str = ""
     timecode: str = "--:--:--:--"
-    rate: str = ""
+    rate: str = ""                    # best knowledge: measured, else the flag
+    rate_flagged: str = ""            # what the sender's rate bits claim
+    rate_detected: bool = False       # True once measured from the numbers
+    rate_mismatch: bool = False       # flag disagrees with the measurement
+    rate_note: str = ""               # caveat on the rate, if any
+    # What the dashboard's flywheel needs to run the clock between snapshots
+    tc_parts: list = field(default_factory=lambda: [0, 0, 0, 0])
+    nominal: int = 30                 # frame numbers run 0..nominal-1
+    drop_frame: bool = False
+    measured_fps: float = 0.0         # frames per wall-clock second
     kind: str = ""                    # quarter-frame / full-frame / Art-Net
     updates: int = 0
     updates_per_sec: float = 0.0
@@ -570,14 +658,29 @@ class TimecodeSource:
     last_seen: float = field(default_factory=now)
     last_change: float = 0.0
 
-    def to_dict(self):
+    def to_dict(self, hold: float = 5.0):
         d = asdict(self)
         t = now()
-        d["online"] = (t - self.last_seen) < 5.0
+        d["fresh"] = (t - self.last_seen) < 1.5           # packets arriving now
+        d["online"] = (t - self.last_seen) < hold          # within the hold time
         # Rolling = the clock is actually advancing, not just arriving: a
         # parked deck keeps sending the same frame.
-        d["running"] = d["online"] and (t - self.last_change) < 1.0
+        d["running"] = d["fresh"] and (t - self.last_change) < 1.0
+        d["since_seen"] = t - self.last_seen
+        if not d["running"]:
+            d["measured_fps"] = 0.0
         return d
+
+
+def transport_rank(name: str) -> int:
+    return 0 if name.startswith("Art-Net") else 1 if name.startswith("ipMIDI") else 2
+
+
+def ip_key(ip: str):
+    try:
+        return tuple(int(x) for x in ip.split("."))
+    except ValueError:
+        return (999, ip)
 
 
 @dataclass
@@ -614,6 +717,12 @@ class Engine:
         # the wire. A preference, not a lock: the UI falls back to another
         # source while this one is silent and returns to it when it is back.
         self.preferred_tc_ip: str = ""
+        # How long the headline stays on a master after its signal stops
+        # before another one is allowed to take over.
+        self.tc_hold: float = 5.0
+        self.tc_lead: Optional[str] = None
+        self.tc_lead_reason: str = ""
+        self.rate_detectors: Dict[str, RateDetector] = {}
         self.started = now()
         self.local_ips: List[str] = []
 
@@ -682,11 +791,24 @@ class Engine:
         src = self.timecode.setdefault(
             key, TimecodeSource(ip=ip, transport=transport, port=port))
         t = now()
-        text = fmt_timecode(reading["tc"])
+        det = self.rate_detectors.setdefault(key, RateDetector())
+        det.add(t, reading["tc"])
+        code = reading["rate_code"]
+        tc = reading["tc"]
+        if reading["offset"]:
+            tc = advance_timecode(tc, reading["offset"], det.nominal(code))
+        text = fmt_timecode(tc)
         if text != src.timecode:
             src.last_change = t
         src.timecode = text
-        src.rate = reading["rate"]
+        src.rate, src.rate_detected, src.rate_note = det.label(code)
+        src.rate_flagged = MTC_RATES[code][0]
+        src.rate_mismatch = bool(det.family) and det.family != MTC_RATES[code][1]
+        src.measured_fps = det.measured
+        src.tc_parts = list(tc)
+        src.nominal = det.nominal(code)
+        src.drop_frame = (src.nominal == 30 and
+                          (det.drop if det.drop is not None else code == 2))
         src.kind = reading["kind"]
         src.updates += 1
         src.last_seen = t
@@ -742,12 +864,66 @@ class Engine:
             self.timecode.pop(k)
             self.tc_rate.pop(k, None)
             self.midi_decoders.pop(k, None)
+            self.rate_detectors.pop(k, None)
+            if self.tc_lead == k:
+                self.tc_lead = None
         for ip in [i for i, e in self.midi_endpoints.items()
                    if t - e.last_seen > 900]:
             self.midi_endpoints.pop(ip)
 
+    # -- which master the dashboard headlines ------------------------------
+
+    def choose_lead(self) -> None:
+        """Sticky choice of the timecode master to headline.
+
+        Rules, in order:
+        1. A source at the preferred IP with signal wins. Between that IP's
+           transports we stay with the one already shown while it has signal.
+        2. Otherwise the current lead keeps the spot while it has signal
+           (received within the hold time). It only yields early if it has
+           stood still for a whole hold time while another master rolls.
+        3. Otherwise the best source that still has signal: rolling before
+           parked, then by transport, then by IP - never by "last heard",
+           which reorders every refresh.
+        4. If nothing has signal we keep showing the last lead rather than
+           hop between dead sources.
+        """
+        t = now()
+        srcs = list(self.timecode.values())
+        held = lambda s: (t - s.last_seen) < self.tc_hold
+        rolling = lambda s: held(s) and (t - s.last_seen) < 1.5 and (t - s.last_change) < 1.0
+        rank = lambda s: (0 if rolling(s) else 1, transport_rank(s.transport), ip_key(s.ip))
+        key = lambda s: f"{s.transport}|{s.ip}"
+        cur = self.timecode.get(self.tc_lead) if self.tc_lead else None
+
+        if self.preferred_tc_ip:
+            mine = [s for s in srcs if s.ip == self.preferred_tc_ip and held(s)]
+            if mine:
+                if not (cur and cur in mine):
+                    cur = min(mine, key=rank)
+                self.tc_lead, self.tc_lead_reason = key(cur), "preferred"
+                return
+
+        if cur and held(cur):
+            stood_still = (t - cur.last_change) >= self.tc_hold
+            if stood_still:
+                others = [s for s in srcs if s is not cur and rolling(s)]
+                if others:
+                    cur = min(others, key=rank)
+        else:
+            live = [s for s in srcs if held(s)]
+            if live:
+                cur = min(live, key=rank)
+            elif cur is None and srcs:
+                cur = max(srcs, key=lambda s: s.last_seen)
+        self.tc_lead = key(cur) if cur else None
+        self.tc_lead_reason = ("" if not cur else
+                               "fallback" if self.preferred_tc_ip else "auto")
+
     def snapshot(self) -> dict:
         artnet_ips = set(self.devices)
+        self.choose_lead()
+        pref = self.preferred_tc_ip
         return {
             "type": "snapshot",
             "uptime": now() - self.started,
@@ -762,20 +938,32 @@ class Engine:
                             if d.ip not in artnet_ips],
             "universes": [u.to_dict() for u in
                           sorted(self.universes.values(), key=lambda u: (u.universe, u.source_ip))],
+            # Stable order (preferred IP first, then IP, then transport) so
+            # the table never reshuffles under the operator's eyes.
             "timecode": [self._tc_dict(s) for s in
                          sorted(self.timecode.values(),
-                                key=lambda s: (-s.last_seen, s.transport))],
+                                key=lambda s: (s.ip != pref, ip_key(s.ip),
+                                               transport_rank(s.transport)))],
             "midi_endpoints": [e.to_dict() for e in
                                sorted(self.midi_endpoints.values(),
                                       key=lambda e: (e.name.lower(), e.ip))],
             "timecode_listeners": self.listeners,
             "preferred_tc_ip": self.preferred_tc_ip,
+            "tc_hold": self.tc_hold,
+            "tc_lead": self.tc_lead,
+            "tc_lead_reason": self.tc_lead_reason,
         }
 
     def _tc_dict(self, src: TimecodeSource) -> dict:
         # Names can arrive after the timecode does (an ArtPollReply or an
         # mDNS announcement later on), so resolve at send time.
-        d = src.to_dict()
+        d = src.to_dict(self.tc_hold)
+        d["key"] = f"{src.transport}|{src.ip}"
+        r = self.tc_rate.get(d["key"])
+        d["updates_per_sec"] = r.pps() if r else 0.0     # decays once packets stop
+        # Age of the displayed frame at snapshot time, so the browser can
+        # advance from it without needing to agree with our clock.
+        d["tc_age"] = max(0.0, now() - src.last_change) if src.last_change else 0.0
         d["name"] = src.name or self.name_for_ip(src.ip)
         return d
 
@@ -1062,7 +1250,9 @@ engine = Engine()
 transport_ref: dict = {}
 ARGS = argparse.Namespace(lan_scan=True, poll_interval=5.0,
                           mtc=True, ipmidi_buses=4, mdns=True, rtp_midi=False,
-                          preferred_tc_ip="")
+                          preferred_tc_ip="", tc_hold=5.0)
+
+TC_HOLD_MIN, TC_HOLD_MAX = 1.0, 120.0
 
 
 def valid_ipv4(text: str) -> bool:
@@ -1108,6 +1298,7 @@ async def task_prune():
 async def lifespan(app: FastAPI):
     engine.local_ips = [ip for ip, _ in list_local_networks()]
     engine.preferred_tc_ip = ARGS.preferred_tc_ip
+    engine.tc_hold = ARGS.tc_hold
     transport_ref["t"] = await open_artnet_socket(engine)
     extra_transports = await open_mtc_listeners(engine) if ARGS.mtc else []
     tasks = [asyncio.create_task(task_artpoll()),
@@ -1132,15 +1323,27 @@ async def api_snapshot():
     return JSONResponse(engine.snapshot())
 
 
-@app.post("/api/timecode/preferred")
-async def api_set_preferred_tc(body: dict = Body(...)):
-    """Set (or clear, with "") the preferred timecode master's IP."""
-    ip = str(body.get("ip", "")).strip()
-    if ip and not valid_ipv4(ip):
-        return JSONResponse({"ok": False, "error": "not a valid IPv4 address"},
-                            status_code=400)
-    engine.preferred_tc_ip = ip
-    return JSONResponse({"ok": True, "preferred_tc_ip": ip})
+@app.post("/api/timecode/settings")
+async def api_timecode_settings(body: dict = Body(...)):
+    """Update the timecode headline settings. Fields are optional:
+    "preferred_ip" ("" clears it) and "hold" (seconds, 1-120)."""
+    if "preferred_ip" in body:
+        ip = str(body["preferred_ip"] or "").strip()
+        if ip and not valid_ipv4(ip):
+            return JSONResponse({"ok": False, "error": "not a valid IPv4 address"},
+                                status_code=400)
+        engine.preferred_tc_ip = ip
+    if "hold" in body:
+        try:
+            hold = float(body["hold"])
+        except (TypeError, ValueError):
+            hold = -1.0
+        if not (TC_HOLD_MIN <= hold <= TC_HOLD_MAX):
+            return JSONResponse({"ok": False, "error": f"hold must be {TC_HOLD_MIN:g}-{TC_HOLD_MAX:g} seconds"},
+                                status_code=400)
+        engine.tc_hold = hold
+    return JSONResponse({"ok": True, "preferred_tc_ip": engine.preferred_tc_ip,
+                         "tc_hold": engine.tc_hold})
 
 
 @app.websocket("/ws")
@@ -1183,6 +1386,10 @@ def main():
                     help="timecode master to headline on the dashboard when "
                          "several are on the wire (falls back to another "
                          "source while it is silent); can also be set in the UI")
+    ap.add_argument("--mtc-hold", type=float, default=5.0, metavar="SECONDS",
+                    help="how long the headline stays on a timecode master "
+                         "after its signal stops before another may take over "
+                         "(default 5, range 1-120); can also be set in the UI")
     ap.add_argument("--rtp-midi", action="store_true",
                     help="also listen on the RTP-MIDI/AppleMIDI ports 5004/5005 "
                          "(only useful when this machine is a session endpoint "
@@ -1197,6 +1404,9 @@ def main():
     if a.preferred_mtc_ip and not valid_ipv4(a.preferred_mtc_ip):
         ap.error(f"--preferred-mtc-ip: '{a.preferred_mtc_ip}' is not an IPv4 address")
     ARGS.preferred_tc_ip = a.preferred_mtc_ip
+    if not (TC_HOLD_MIN <= a.mtc_hold <= TC_HOLD_MAX):
+        ap.error(f"--mtc-hold must be between {TC_HOLD_MIN:g} and {TC_HOLD_MAX:g} seconds")
+    ARGS.tc_hold = a.mtc_hold
 
     local = engine.local_ips or [ip for ip, _ in list_local_networks()]
     print("=" * 62)
