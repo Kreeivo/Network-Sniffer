@@ -114,6 +114,76 @@ function renderUniverses(unis) {
     </tr>`).join("");
 }
 
+/* ---------------- timecode (MTC) panel ---------------- */
+
+let tcLeadKey = null;
+
+function tcStateOf(s) {
+  if (!s.online) return "off";
+  return s.running ? "running" : "holding";
+}
+
+function renderTimecode(snap) {
+  const sources = snap.timecode || [];
+  const hero = document.querySelector(".tc-hero");
+  const listeners = snap.timecode_listeners || [];
+  $("tc-listeners").textContent = listeners.length
+    ? "listening: " + listeners.join(" · ") : "timecode listeners disabled";
+
+  // Headline clock: stick with the master we showed last time while it is
+  // still rolling, so two masters in lock-step don't flicker; otherwise the
+  // longest-established rolling source, else whoever we heard from last
+  // (the list arrives sorted by last_seen).
+  const keyOf = (s) => `${s.transport}|${s.ip}`;
+  const rolling = sources.filter((s) => s.running);
+  let lead = rolling.find((s) => keyOf(s) === tcLeadKey);
+  if (!lead) lead = rolling.sort((a, b) => a.first_seen - b.first_seen)[0] || sources[0];
+  tcLeadKey = lead ? keyOf(lead) : null;
+  hero.classList.remove("running", "holding");
+  if (!lead) {
+    $("tc-clock").textContent = "--:--:--:--";
+    $("tc-source").textContent = "No timecode seen yet";
+    $("tc-detail").textContent = "Start your timecode master — Art-Net timecode and ipMIDI appear here automatically.";
+    $("tc-state-text").textContent = "no signal";
+  } else {
+    const state = tcStateOf(lead);
+    if (state !== "off") hero.classList.add(state);
+    $("tc-clock").textContent = lead.timecode;
+    $("tc-source").textContent = lead.name ? `${lead.name}  (${lead.ip})` : lead.ip;
+    $("tc-detail").textContent = `${lead.transport} · ${lead.rate} · ${lead.kind}`;
+    $("tc-state-text").textContent =
+      state === "running" ? "rolling" :
+      state === "holding" ? "holding — master is sending but the clock isn't moving" :
+      "signal lost";
+  }
+
+  const tbody = $("tc-table").querySelector("tbody");
+  if (!sources.length) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="8">No MTC on the wire yet.</td></tr>`;
+  } else {
+    tbody.innerHTML = sources.map((s) => {
+      const state = tcStateOf(s);
+      const cls = state === "running" ? "" : state === "holding" ? " hold" : " off";
+      return `
+      <tr>
+        <td>${esc(s.name || "—")}</td>
+        <td class="mono">${esc(s.ip)}</td>
+        <td>${esc(s.transport)}</td>
+        <td class="mono tc-cell${cls}"><b>${esc(s.timecode)}</b></td>
+        <td class="mono">${esc(s.rate)}</td>
+        <td>${esc(s.kind)}</td>
+        <td class="mono">${s.updates_per_sec.toFixed(1)} /s</td>
+        <td><span class="pill ${s.online ? "" : "off"}"></span></td>
+      </tr>`;
+    }).join("");
+  }
+
+  const eps = snap.midi_endpoints || [];
+  $("midi-endpoints").innerHTML = eps.length
+    ? eps.map((e) => `<span class="chip midi ${e.online ? "" : "off"}" title="${esc(e.source)}${e.port ? " · port " + e.port : ""}">${esc(e.name || e.ip)}${e.name ? ` <span class="mono">${esc(e.ip)}</span>` : ""}</span>`).join("")
+    : `<span class="hint">none heard yet</span>`;
+}
+
 /* ---------------- LAN table ---------------- */
 
 function renderLan(devs) {
@@ -144,11 +214,17 @@ function svgEl(tag, attrs, text) {
 function renderTopology(snap) {
   const svg = $("topo");
   svg.innerHTML = "";
-  const shownCount = Math.min(9, snap.devices.length + snap.lan_devices.length);
+  const known = new Set([...snap.devices, ...snap.lan_devices].map((d) => d.ip));
+  const tcOnly = [];
+  for (const s of snap.timecode || []) {
+    if (!known.has(s.ip)) { known.add(s.ip); tcOnly.push(s); }
+  }
+  const shownCount = Math.min(9, snap.devices.length + tcOnly.length + snap.lan_devices.length);
   const W = 900, H = Math.max(240, shownCount * 62 + 130);
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
 
-  // Everything visible on the LAN, Art-Net devices first.
+  // Everything visible on the LAN, Art-Net devices first, then timecode
+  // masters heard over MIDI, then the rest of the LAN.
   const nodes = [
     ...snap.devices.map((d) => ({
       label: d.short_name || d.long_name || d.ip,
@@ -156,6 +232,14 @@ function renderTopology(snap) {
       active: d.bytes_per_sec > 1,
       online: d.online,
       artnet: true,
+    })),
+    ...tcOnly.map((s) => ({
+      label: s.name || s.ip,
+      sub: `${s.ip} · ${s.transport}`,
+      active: s.online,
+      online: s.online,
+      artnet: false,
+      timecode: true,
     })),
     ...snap.lan_devices.map((d) => ({
       label: d.hostname || d.vendor || d.ip,
@@ -204,8 +288,8 @@ function renderTopology(snap) {
       d: `M ${hubX + 26} ${midY} C ${c1x} ${midY}, ${c1x} ${y}, ${devX - 78} ${y}`,
       class: "topo-link" + (n.active ? " flowing" : ""),
     }));
-    const stroke = !n.online ? "#f26d6d" : (n.artnet ? "#ffb020" : "#2b3138");
-    svg.appendChild(svgEl("rect", { x: devX - 78, y: y - 22, width: 200, height: 44, rx: 5, fill: "#22272d", stroke, "stroke-width": n.artnet ? 1.6 : 1 }));
+    const stroke = !n.online ? "#f26d6d" : (n.artnet ? "#ffb020" : n.timecode ? "#b58cff" : "#2b3138");
+    svg.appendChild(svgEl("rect", { x: devX - 78, y: y - 22, width: 200, height: 44, rx: 5, fill: "#22272d", stroke, "stroke-width": (n.artnet || n.timecode) ? 1.6 : 1 }));
     const label = n.label.length > 22 ? n.label.slice(0, 21) + "…" : n.label;
     svg.appendChild(svgEl("text", { x: devX - 66, y: y - 2, class: "topo-label" }, label));
     svg.appendChild(svgEl("text", { x: devX - 66, y: y + 15, class: "topo-sub" }, n.sub));
@@ -250,6 +334,7 @@ function connect() {
 
     renderDevices(snap.devices);
     renderUniverses(snap.universes);
+    renderTimecode(snap);
     renderLan(snap.lan_devices);
     renderTopology(snap);
   };

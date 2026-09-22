@@ -1,13 +1,18 @@
 """
-Art-Net traffic simulator - for testing the Inspector with NO hardware.
+Art-Net + MTC traffic simulator - for testing the Inspector with NO hardware.
 
 Run this in a second terminal while app.py is running and the dashboard
-will light up with two fake devices ("FOH-CONSOLE" and "PIXEL-NODE-1")
-and three universes of moving DMX data at ~40 fps.
+will light up with a fake node ("PIXEL-NODE-1"), three universes of moving
+DMX data at ~40 fps, and a timecode clock rolling at 25 fps on two
+transports at once:
+
+    * Art-Net timecode (ArtTimeCode) from the same fake node
+    * ipMIDI bus 1 quarter-frame MTC (multicast 225.0.0.37:21928)
 
     python simulator.py
 
-Everything stays on 127.0.0.1 - nothing is sent onto your real network.
+Everything stays on this machine - Art-Net goes to 127.0.0.1 and the
+ipMIDI multicast is sent with TTL 0, which never leaves the host.
 Stop it with Ctrl+C.
 """
 import socket
@@ -17,7 +22,13 @@ import time
 ARTNET_ID = b"Art-Net\x00"
 OP_POLL_REPLY = 0x2100
 OP_DMX = 0x5000
+OP_TIMECODE = 0x9700
 TARGET = ("127.0.0.1", 6454)
+IPMIDI = ("225.0.0.37", 21928)          # bus 1
+
+TC_FPS = 25                             # MTC rate code 1 = 25 fps (EBU)
+TC_RATE_CODE = 1
+TC_START = (0, 59, 50, 0)               # roll from 00:59:50:00 so it crosses the hour
 
 
 def poll_reply(ip, short, long_, style, mac, out_unis=()):
@@ -44,25 +55,72 @@ def dmx(universe, seq):
     return ARTNET_ID + struct.pack("<H", OP_DMX) + body
 
 
+def frames_to_tc(total):
+    f = total % TC_FPS
+    s = (total // TC_FPS) % 60
+    m = (total // (TC_FPS * 60)) % 60
+    h = (total // (TC_FPS * 3600)) % 24
+    return h, m, s, f
+
+
+def art_timecode(h, m, s, f):
+    # ProtVerHi, ProtVerLo, Filler1, Filler2, Frames, Seconds, Minutes, Hours, Type
+    return ARTNET_ID + struct.pack("<H", OP_TIMECODE) + bytes(
+        [0, 14, 0, 0, f, s, m, h, TC_RATE_CODE])
+
+
+def mtc_quarter_frames(h, m, s, f):
+    """The eight F1 messages that spell out one timecode value."""
+    nibbles = [f & 0xF, f >> 4, s & 0xF, s >> 4, m & 0xF, m >> 4,
+               h & 0xF, ((h >> 4) & 0x1) | (TC_RATE_CODE << 1)]
+    return [bytes([0xF1, (i << 4) | n]) for i, n in enumerate(nibbles)]
+
+
 def main():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    mc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    mc.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 0)   # host only
+    mc.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+
     node = poll_reply("127.0.0.1", "PIXEL-NODE-1",
                       "Backstage 8-port Art-Net Node", 0x00,
                       bytes([0xAA, 0xBB, 0xCC, 0x01, 0x02, 0x03]),
                       out_unis=(0, 1, 2))
     print("Simulator running - sending fake Art-Net to 127.0.0.1:6454")
-    print("Open the dashboard and you should see PIXEL-NODE-1 with 3 universes.")
+    print("and MTC quarter-frames to ipMIDI bus 1 (225.0.0.37:21928, TTL 0).")
+    print("Open the dashboard: PIXEL-NODE-1 with 3 universes, timecode rolling at 25 fps.")
     print("Ctrl+C to stop.")
     seq = 0
     last_reply = 0.0
+    h, m, sec, f = TC_START
+    tc_frame = ((h * 60 + m) * 60 + sec) * TC_FPS + f
+    tc_next = time.time()
+    qf_index = 0
     try:
         while True:
-            if time.time() - last_reply > 4:
+            t = time.time()
+            if t - last_reply > 4:
                 s.sendto(node, TARGET)
-                last_reply = time.time()
+                last_reply = t
             for uni in (0, 1, 2):
                 s.sendto(dmx(uni, seq), TARGET)
             seq += 1
+
+            # Timecode: one ArtTimeCode per frame, and the MTC quarter-frames
+            # spread over the two frames they describe (4 per frame).
+            while t >= tc_next:
+                tc = frames_to_tc(tc_frame)
+                s.sendto(art_timecode(*tc), TARGET)
+                if qf_index == 0:
+                    qf = mtc_quarter_frames(*tc)
+                for msg in qf[qf_index:qf_index + 4]:
+                    try:
+                        mc.sendto(msg, IPMIDI)
+                    except OSError:
+                        pass                      # no multicast route - skip
+                qf_index = (qf_index + 4) % 8
+                tc_frame += 1
+                tc_next += 1 / TC_FPS
             time.sleep(1 / 40)
     except KeyboardInterrupt:
         print("\nSimulator stopped.")

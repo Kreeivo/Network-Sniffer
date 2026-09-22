@@ -14,15 +14,21 @@ where it's coming from.
 - **Live traffic feed** — total network bandwidth with a rolling graph,
   plus per-device and per-universe rates: frame rate (fps), active channel
   count, and kB/s, updated twice a second over a WebSocket.
+- **Timecode (MTC) monitor** — passively listens for MIDI Time Code on the
+  network and shows a big rolling HH:MM:SS:FF clock per timecode master,
+  with its frame rate, transport and whether it is rolling, parked or
+  lost. Covers Art-Net timecode (ArtTimeCode), ipMIDI multicast and,
+  optionally, RTP-MIDI/AppleMIDI; network-MIDI sessions announced over
+  mDNS are listed by name.
 - **Live network map** — this computer → switch → every device, with lines
   that animate while data is actually flowing on that link.
 - **Other LAN devices** — a best-effort ping + ARP scan surfaces
   non-Art-Net gear (show-control PCs, media servers, managed switches)
   with hostname and vendor where available.
-- **Show-safe** — passive by design. It never sends DMX, only tiny ArtPoll
-  discovery packets (the same thing every console sends) and pings. It
-  binds the Art-Net port in shared mode, so it can run on the same machine
-  as your console or visualiser software without interfering.
+- **Show-safe** — passive by design. It never sends DMX or MIDI, only tiny
+  ArtPoll discovery packets (the same thing every console sends) and
+  pings. It binds the Art-Net port in shared mode, so it can run on the
+  same machine as your console or visualiser software without interfering.
 
 ---
 
@@ -98,8 +104,10 @@ python simulator.py
 ```
 
 A fake node called **PIXEL-NODE-1** appears with three universes of moving
-DMX at 40 fps. Everything stays on 127.0.0.1 — nothing touches your real
-network. Ctrl+C to stop.
+DMX at 40 fps, and the timecode panel starts rolling at 25 fps from two
+transports at once (Art-Net timecode and ipMIDI bus 1). Everything stays
+on this machine — the Art-Net goes to 127.0.0.1 and the ipMIDI multicast
+is sent with TTL 0, so nothing touches your real network. Ctrl+C to stop.
 
 ---
 
@@ -109,6 +117,10 @@ network. Ctrl+C to stop.
 python app.py --port 9000        # different dashboard port
 python app.py --no-lan-scan     # skip the ping/ARP sweep (Art-Net only)
 python app.py --poll-interval 10 # ArtPoll every 10 s instead of 5
+python app.py --ipmidi-buses 8   # watch ipMIDI buses 1-8 (default 1-4)
+python app.py --rtp-midi         # also listen on RTP-MIDI ports 5004/5005
+python app.py --no-mdns          # don't listen for network-MIDI announcements
+python app.py --no-mtc           # turn the timecode listeners off entirely
 ```
 
 ---
@@ -123,6 +135,17 @@ python app.py --poll-interval 10 # ArtPoll every 10 s instead of 5
 - **Art-Net devices** — one card per device. `U0 out` chips are the
   universes that device outputs (to fixtures); `in` chips are inputs. The
   amber left edge means it answered a poll recently; red means offline.
+- **Timecode (MTC) on the network** — the big clock is the master that is
+  currently rolling (violet), or the last one heard. Amber means the master
+  is still sending but the clock isn't moving (a parked deck or a stopped
+  transport); grey means the signal has gone. The table below lists every
+  master by transport, so you can see at a glance whether your Art-Net
+  timecode and your ipMIDI feed agree. "Format" tells you whether a MIDI
+  source is sending quarter-frame MTC (rolling) or full-frame messages
+  (locate/park). The chips underneath are network-MIDI (RTP-MIDI)
+  sessions that have announced themselves over mDNS, by their session
+  name — useful for confirming a Mac or a MIDI-over-Ethernet box is on
+  the network even before it starts sending timecode.
 - **DMX universes on the wire** — every universe currently being
   transmitted, who is sending it, at what frame rate (consoles typically
   sit around 30–44 fps), how many of its channels are above zero, and its
@@ -143,6 +166,18 @@ python app.py --poll-interval 10 # ArtPoll every 10 s instead of 5
 - **ShowKontrol / other protocols:** if it speaks Art-Net it'll appear
   with full detail; otherwise it appears in "Other devices" from the LAN
   scan with its hostname.
+- **Which timecode transports are visible:** Art-Net timecode is broadcast
+  and ipMIDI is multicast, so this machine sees both through any switch
+  with nothing to configure. RTP-MIDI (Apple Network MIDI, most
+  MIDI-over-Ethernet boxes) is different: it is a *unicast* session between
+  two endpoints, so it can only be observed on a machine that is one of
+  those endpoints — and there your MIDI software normally owns the port.
+  That's why `--rtp-midi` is off by default; turn it on when this PC is
+  the session partner and nothing else has UDP 5004/5005 open. The tool
+  never takes those ports in shared mode, so it can't steal MIDI packets
+  from your console software. Quarter-frame MTC is displayed two frames
+  ahead of the value carried in the messages, as the MIDI spec intends,
+  so it lines up with the Art-Net clock.
 - **Coexistence:** safe to run next to your console software on the same
   machine — the Art-Net port is opened in shared (reuse) mode.
 
