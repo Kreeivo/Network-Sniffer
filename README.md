@@ -172,7 +172,16 @@ python app.py --no-mtc           # turn the timecode listeners off entirely
   displayed, at the real rate, with a ⚠ and the flagged value in the
   tooltip — so a console set to 24 fps that is actually chasing 30 fps
   timecode is caught rather than hidden. The rate the clock is running
-  at, in frames per wall-clock second, sits next to it while rolling. "Format" tells you whether a MIDI
+  at, in frames per wall-clock second, sits next to it while rolling.
+- **The digits run at the frame rate**, not at the dashboard's refresh
+  rate. The browser gets each master's last frame and its age, then
+  advances its own clock at the detected rate between updates, the way a
+  hardware timecode display freewheels between reads — so a 25 fps
+  master counts 0, 1, 2… on screen rather than jumping a dozen frames
+  twice a second. Each update trims the local clock's rate by a few
+  percent to absorb any drift instead of stepping it, so a frame is never
+  skipped or shown twice; only a real jump (the master locating) re-syncs
+  outright. A parked master's digits stand still. "Format" tells you whether a MIDI
   source is sending quarter-frame MTC (rolling) or full-frame messages
   (locate/park). The chips underneath are network-MIDI (RTP-MIDI)
   sessions that have announced themselves over mDNS, by their session

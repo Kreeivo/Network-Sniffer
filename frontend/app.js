@@ -175,6 +175,83 @@ function tcSyncBox(box, value) {
   if (box.value !== String(value)) { box.value = value; box.classList.remove("bad"); }
 }
 
+/* ---- flywheel: run the clock between snapshots at the real frame rate ----
+   Snapshots arrive twice a second; a 25 fps clock updated at 2 Hz jumps
+   twelve frames at a time. Instead each source's last frame and its age
+   anchor a local clock that advances at the detected rate, exactly like a
+   hardware timecode display freewheeling between reads. Every snapshot
+   re-anchors, but only if the local clock has drifted by more than a
+   frame, so a well-behaved stream never visibly jumps. */
+
+function tcCount([h, m, s, f], n, drop) {
+  const mins = h * 60 + m;
+  let c = (mins * 60 + s) * n + f;
+  if (drop && n === 30) c -= 2 * (mins - Math.floor(mins / 10));   // frames that never existed
+  return c;
+}
+function tcFromCount(c, n, drop) {
+  const df = drop && n === 30;
+  const day = 24 * 3600 * n - (df ? 2 * (1440 - 144) : 0);
+  c = ((c % day) + day) % day;
+  if (df) {
+    const d = Math.floor(c / 17982), mm = c % 17982;
+    c += 18 * d + (mm < 2 ? 0 : 2 * Math.floor((mm - 2) / 1798));
+  }
+  const p2 = (x) => String(x).padStart(2, "0");
+  return `${p2(Math.floor(c / (3600 * n)) % 24)}:${p2(Math.floor(c / (60 * n)) % 60)}:${p2(Math.floor(c / n) % 60)}:${p2(c % n)}`;
+}
+function tcFps(base) {
+  return base.nominal === 30 && base.drop ? 30000 / 1001 : base.nominal;
+}
+function tcPredictCount(base, nowMs) {
+  return Math.floor(base.countF + ((nowMs - base.at) / 1000) * base.fpsEff);
+}
+
+const tcFly = { bases: new Map(), cells: new Map(), clockKey: null, lastText: new Map() };
+const TC_SLEW_MAX = 0.04;      // at most ±4 % rate change to absorb drift
+const TC_JUMP_FRAMES = 3;      // further out than this is a locate: re-sync hard
+
+/* Reconcile a source's local clock with the snapshot. Rather than stepping
+   the phase (which shows as a skipped or repeated frame) the clock's rate
+   is trimmed by a few percent until the drift is gone, so frame periods
+   stretch imperceptibly and the count still rises by exactly one each
+   time. Only a real jump, e.g. the master locating, re-syncs hard. */
+function tcAnchor(s, nowMs) {
+  const fps = tcFps({ nominal: s.nominal, drop: s.drop_frame });
+  const serverF = tcCount(s.tc_parts, s.nominal, s.drop_frame) + s.tc_age * fps;
+  const old = tcFly.bases.get(s.key);
+  if (old && old.running && s.running && old.nominal === s.nominal && old.drop === s.drop_frame) {
+    const cur = old.countF + ((nowMs - old.at) / 1000) * old.fpsEff;
+    const drift = cur - serverF;                     // + = local clock ahead
+    if (Math.abs(drift) <= TC_JUMP_FRAMES) {
+      old.countF = cur; old.at = nowMs; old.text = s.timecode;
+      const k = Math.max(-TC_SLEW_MAX, Math.min(TC_SLEW_MAX, drift * 0.04));
+      old.fpsEff = fps * (1 - k);
+      return;
+    }
+  }
+  tcFly.bases.set(s.key, {
+    countF: serverF, at: nowMs, fpsEff: fps,
+    nominal: s.nominal, drop: s.drop_frame, running: s.running, text: s.timecode,
+  });
+}
+
+function tcPaint(nowMs) {
+  const paint = (key, el, slot) => {
+    const base = tcFly.bases.get(key);
+    if (!base || !el) return;
+    const text = base.running ? tcFromCount(tcPredictCount(base, nowMs), base.nominal, base.drop) : base.text;
+    if (tcFly.lastText.get(slot) !== text) { el.textContent = text; tcFly.lastText.set(slot, text); }
+  };
+  if (tcFly.clockKey) paint(tcFly.clockKey, $("tc-clock"), "clock");
+  for (const [key, el] of tcFly.cells) paint(key, el, key);
+}
+function tcTick(nowMs) {
+  tcPaint(nowMs);
+  requestAnimationFrame(tcTick);
+}
+requestAnimationFrame(tcTick);
+
 /* rolling / holding (parked) / lost (in the hold window) / off */
 function tcStateOf(s) {
   if (!s.online) return "off";
@@ -205,6 +282,11 @@ function renderTimecode(snap) {
   tcSyncBox($("tc-pref-ip"), preferredIp);
   tcSyncBox($("tc-hold"), hold);
 
+  const nowMs = performance.now();
+  const live = new Set(sources.map((s) => s.key));
+  for (const s of sources) tcAnchor(s, nowMs);
+  for (const key of [...tcFly.bases.keys()]) if (!live.has(key)) tcFly.bases.delete(key);
+
   const lead = sources.find((s) => s.key === snap.tc_lead) || null;
   const msg = $("tc-pref-msg");
   if (tcSettings.invalid) {
@@ -222,6 +304,7 @@ function renderTimecode(snap) {
 
   hero.classList.remove("running", "holding", "lost");
   if (!lead) {
+    tcFly.clockKey = null;
     $("tc-clock").textContent = "--:--:--:--";
     $("tc-source").textContent = "No timecode seen yet";
     $("tc-detail").textContent = "Start your timecode master — Art-Net timecode and ipMIDI appear here automatically.";
@@ -229,7 +312,7 @@ function renderTimecode(snap) {
   } else {
     const state = tcStateOf(lead);
     if (state !== "off") hero.classList.add(state);
-    $("tc-clock").textContent = lead.timecode;
+    tcFly.clockKey = lead.key;                    // the flywheel paints the digits
     $("tc-source").textContent = lead.name ? `${lead.name}  (${lead.ip})` : lead.ip;
     const rateTxt = lead.rate_mismatch ? `${lead.rate} ⚠ (flagged ${lead.rate_flagged})`
                   : lead.rate_detected && lead.rate_note ? `${lead.rate} (${lead.rate_note})`
@@ -257,7 +340,7 @@ function renderTimecode(snap) {
         <td>${esc(s.name || "—")}${s.ip === preferredIp ? `<span class="tag">preferred</span>` : ""}${isLead ? `<span class="tag lead">on clock</span>` : ""}</td>
         <td class="mono">${esc(s.ip)}</td>
         <td>${esc(s.transport)}</td>
-        <td class="mono tc-cell${cls}"><b>${esc(s.timecode)}</b></td>
+        <td class="mono tc-cell${cls}"><b data-key="${esc(s.key)}">${esc(s.timecode)}</b></td>
         <td class="mono">${fmtRate(s)}</td>
         <td>${esc(s.kind)}</td>
         <td class="mono">${s.updates_per_sec.toFixed(1)} /s</td>
@@ -265,6 +348,10 @@ function renderTimecode(snap) {
       </tr>`;
     }).join("");
   }
+
+  tcFly.cells.clear();
+  for (const el of tbody.querySelectorAll("b[data-key]")) { tcFly.cells.set(el.dataset.key, el); tcFly.lastText.delete(el.dataset.key); }
+  tcPaint(performance.now());   // never leave the server's older string on screen
 
   const eps = snap.midi_endpoints || [];
   $("midi-endpoints").innerHTML = eps.length

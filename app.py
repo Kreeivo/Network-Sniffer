@@ -646,6 +646,10 @@ class TimecodeSource:
     rate_detected: bool = False       # True once measured from the numbers
     rate_mismatch: bool = False       # flag disagrees with the measurement
     rate_note: str = ""               # caveat on the rate, if any
+    # What the dashboard's flywheel needs to run the clock between snapshots
+    tc_parts: list = field(default_factory=lambda: [0, 0, 0, 0])
+    nominal: int = 30                 # frame numbers run 0..nominal-1
+    drop_frame: bool = False
     measured_fps: float = 0.0         # frames per wall-clock second
     kind: str = ""                    # quarter-frame / full-frame / Art-Net
     updates: int = 0
@@ -801,6 +805,10 @@ class Engine:
         src.rate_flagged = MTC_RATES[code][0]
         src.rate_mismatch = bool(det.family) and det.family != MTC_RATES[code][1]
         src.measured_fps = det.measured
+        src.tc_parts = list(tc)
+        src.nominal = det.nominal(code)
+        src.drop_frame = (src.nominal == 30 and
+                          (det.drop if det.drop is not None else code == 2))
         src.kind = reading["kind"]
         src.updates += 1
         src.last_seen = t
@@ -953,6 +961,9 @@ class Engine:
         d["key"] = f"{src.transport}|{src.ip}"
         r = self.tc_rate.get(d["key"])
         d["updates_per_sec"] = r.pps() if r else 0.0     # decays once packets stop
+        # Age of the displayed frame at snapshot time, so the browser can
+        # advance from it without needing to agree with our clock.
+        d["tc_age"] = max(0.0, now() - src.last_change) if src.last_change else 0.0
         d["name"] = src.name or self.name_for_ip(src.ip)
         return d
 
