@@ -116,72 +116,81 @@ function renderUniverses(unis) {
 
 /* ---------------- timecode (MTC) panel ---------------- */
 
-let tcLeadKey = null;
-let tcPrefPending = false;   // an edit is being sent; don't overwrite the box
-let tcPrefInvalid = false;   // box holds a rejected entry; leave it (and the error) until edited
+/* The headline master is chosen server-side (sticky, with a hold time) so
+   every open dashboard shows the same one and nothing flip-flops here.
+   The two settings boxes post to the server for the same reason. */
+const tcSettings = { pending: false, invalid: null };   // invalid: id of a box holding a rejected entry
 
-/* Preferred-master box: sent to the server so every open dashboard (the
-   FOH tablet included) headlines the same source. */
-function setupPreferredInput() {
-  const box = $("tc-pref-ip");
-  const msg = $("tc-pref-msg");
-  const send = async () => {
-    const ip = box.value.trim();
-    if (ip && !/^(\d{1,3})(\.\d{1,3}){3}$/.test(ip)) {
-      tcPrefInvalid = true;
-      box.classList.add("bad");
-      msg.textContent = "not an IPv4 address";
-      msg.className = "tc-pref-msg bad";
-      return;
-    }
-    tcPrefInvalid = false;
+function tcSetError(box, msg, text) {
+  tcSettings.invalid = box.id;
+  box.classList.add("bad");
+  msg.textContent = text;
+  msg.className = "tc-pref-msg bad";
+}
+
+async function tcPostSettings(payload, box, msg) {
+  tcSettings.pending = true;
+  try {
+    const r = await fetch("/api/timecode/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+    tcSettings.invalid = null;
     box.classList.remove("bad");
-    tcPrefPending = true;
-    try {
-      const r = await fetch("/api/timecode/preferred", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ip }),
-      });
-      if (!r.ok) throw new Error((await r.json()).error || r.statusText);
-      box.value = ip;
-    } catch (e) {
-      tcPrefInvalid = true;
-      box.classList.add("bad");
-      msg.textContent = String(e.message || e);
-      msg.className = "tc-pref-msg bad";
-    } finally {
-      tcPrefPending = false;
-    }
-  };
-  box.addEventListener("change", send);
-  box.addEventListener("input", () => { tcPrefInvalid = false; box.classList.remove("bad"); });
-  box.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); box.blur(); } });
-}
-
-/* Pick the source to headline.  Preference first (while it has signal —
-   rolling or holding), otherwise stay with whatever we showed last if it
-   is still rolling, otherwise the longest-established rolling source,
-   otherwise the most recently heard.  Returns {lead, fallback}. */
-function chooseLead(sources, preferredIp) {
-  const keyOf = (s) => `${s.transport}|${s.ip}`;
-  if (preferredIp) {
-    const mine = sources.filter((s) => s.ip === preferredIp && s.online);
-    const pick = mine.find((s) => s.running && keyOf(s) === tcLeadKey)
-              || mine.find((s) => s.running)
-              || mine[0];
-    if (pick) return { lead: pick, fallback: false };
+  } catch (e) {
+    tcSetError(box, msg, String(e.message || e));
+  } finally {
+    tcSettings.pending = false;
   }
-  const rolling = sources.filter((s) => s.running);
-  const lead = rolling.find((s) => keyOf(s) === tcLeadKey)
-            || rolling.slice().sort((a, b) => a.first_seen - b.first_seen)[0]
-            || sources[0];
-  return { lead, fallback: !!(preferredIp && lead) };
 }
 
+function setupTimecodeSettings() {
+  const ipBox = $("tc-pref-ip"), holdBox = $("tc-hold"), msg = $("tc-pref-msg");
+  const sendIp = () => {
+    const ip = ipBox.value.trim();
+    if (ip && !/^(\d{1,3})(\.\d{1,3}){3}$/.test(ip)) return tcSetError(ipBox, msg, "not an IPv4 address");
+    ipBox.value = ip;
+    return tcPostSettings({ preferred_ip: ip }, ipBox, msg);
+  };
+  const sendHold = () => {
+    const hold = Number(holdBox.value);
+    if (!(hold >= 1 && hold <= 120)) return tcSetError(holdBox, msg, "hold must be 1–120 s");
+    return tcPostSettings({ hold }, holdBox, msg);
+  };
+  for (const [box, send] of [[ipBox, sendIp], [holdBox, sendHold]]) {
+    box.addEventListener("change", send);
+    box.addEventListener("input", () => {
+      if (tcSettings.invalid === box.id) tcSettings.invalid = null;
+      box.classList.remove("bad");
+    });
+    box.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); box.blur(); } });
+  }
+}
+
+/* Sync a settings box from the snapshot unless the operator is using it. */
+function tcSyncBox(box, value) {
+  if (tcSettings.pending || tcSettings.invalid === box.id || document.activeElement === box) return;
+  if (box.value !== String(value)) { box.value = value; box.classList.remove("bad"); }
+}
+
+/* rolling / holding (parked) / lost (in the hold window) / off */
 function tcStateOf(s) {
   if (!s.online) return "off";
+  if (!s.fresh) return "lost";
   return s.running ? "running" : "holding";
+}
+
+function fmtRate(s) {
+  // Detected from the frame numbers on the wire, or the sender's flag
+  // until enough has rolled to tell.
+  if (s.rate_mismatch) {
+    return `<span class="rate-bad" title="Sender flags ${esc(s.rate_flagged)} but the frame numbers say ${esc(s.rate)}">${esc(s.rate)} ⚠</span>`;
+  }
+  if (s.rate_detected && s.rate_note) return `<span title="${esc(s.rate_note)}">${esc(s.rate)} <span class="rate-flag">*</span></span>`;
+  if (s.rate_detected) return `<span title="Measured from the timecode itself">${esc(s.rate)}</span>`;
+  return `<span class="rate-flag" title="From the sender's rate flag — confirming once it rolls">${esc(s.rate)}</span>`;
 }
 
 function renderTimecode(snap) {
@@ -192,29 +201,26 @@ function renderTimecode(snap) {
     ? "listening: " + listeners.join(" · ") : "timecode listeners disabled";
 
   const preferredIp = snap.preferred_tc_ip || "";
-  const box = $("tc-pref-ip");
-  if (!tcPrefPending && !tcPrefInvalid && document.activeElement !== box && box.value !== preferredIp) {
-    box.value = preferredIp;
-    box.classList.remove("bad");
-  }
+  const hold = snap.tc_hold || 5;
+  tcSyncBox($("tc-pref-ip"), preferredIp);
+  tcSyncBox($("tc-hold"), hold);
 
-  const { lead, fallback } = chooseLead(sources, preferredIp);
-  tcLeadKey = lead ? `${lead.transport}|${lead.ip}` : null;
+  const lead = sources.find((s) => s.key === snap.tc_lead) || null;
   const msg = $("tc-pref-msg");
-  if (tcPrefInvalid) {
+  if (tcSettings.invalid) {
     // keep the rejected entry and its error on screen
   } else if (!preferredIp) {
     msg.textContent = ""; msg.className = "tc-pref-msg";
-  } else if (fallback) {
+  } else if (snap.tc_lead_reason === "fallback" && lead) {
     msg.textContent = `${preferredIp} silent — showing ${lead.ip}`;
     msg.className = "tc-pref-msg fallback";
-  } else if (!lead) {
-    msg.textContent = `waiting for ${preferredIp}`;
-    msg.className = "tc-pref-msg";
-  } else {
+  } else if (snap.tc_lead_reason === "preferred") {
     msg.textContent = "✓ preferred"; msg.className = "tc-pref-msg";
+  } else {
+    msg.textContent = `waiting for ${preferredIp}`; msg.className = "tc-pref-msg";
   }
-  hero.classList.remove("running", "holding");
+
+  hero.classList.remove("running", "holding", "lost");
   if (!lead) {
     $("tc-clock").textContent = "--:--:--:--";
     $("tc-source").textContent = "No timecode seen yet";
@@ -225,10 +231,16 @@ function renderTimecode(snap) {
     if (state !== "off") hero.classList.add(state);
     $("tc-clock").textContent = lead.timecode;
     $("tc-source").textContent = lead.name ? `${lead.name}  (${lead.ip})` : lead.ip;
-    $("tc-detail").textContent = `${lead.transport} · ${lead.rate} · ${lead.kind}`;
+    const rateTxt = lead.rate_mismatch ? `${lead.rate} ⚠ (flagged ${lead.rate_flagged})`
+                  : lead.rate_detected && lead.rate_note ? `${lead.rate} (${lead.rate_note})`
+                  : lead.rate_detected ? `${lead.rate} (auto-detected)` : `${lead.rate} (flag)`;
+    const speed = lead.running && lead.measured_fps ? ` · running ${lead.measured_fps.toFixed(2)} fps` : "";
+    $("tc-detail").textContent = `${lead.transport} · ${rateTxt}${speed} · ${lead.kind}`;
+    const left = Math.max(0, hold - lead.since_seen);
     $("tc-state-text").textContent =
       state === "running" ? "rolling" :
       state === "holding" ? "holding — master is sending but the clock isn't moving" :
+      state === "lost"    ? `signal lost — holding ${left.toFixed(0)} s before switching` :
       "signal lost";
   }
 
@@ -239,16 +251,17 @@ function renderTimecode(snap) {
     tbody.innerHTML = sources.map((s) => {
       const state = tcStateOf(s);
       const cls = state === "running" ? "" : state === "holding" ? " hold" : " off";
+      const isLead = s.key === snap.tc_lead;
       return `
-      <tr>
-        <td>${esc(s.name || "—")}${s.ip === preferredIp ? `<span class="tag">preferred</span>` : ""}</td>
+      <tr class="${isLead ? "lead" : ""}">
+        <td>${esc(s.name || "—")}${s.ip === preferredIp ? `<span class="tag">preferred</span>` : ""}${isLead ? `<span class="tag lead">on clock</span>` : ""}</td>
         <td class="mono">${esc(s.ip)}</td>
         <td>${esc(s.transport)}</td>
         <td class="mono tc-cell${cls}"><b>${esc(s.timecode)}</b></td>
-        <td class="mono">${esc(s.rate)}</td>
+        <td class="mono">${fmtRate(s)}</td>
         <td>${esc(s.kind)}</td>
         <td class="mono">${s.updates_per_sec.toFixed(1)} /s</td>
-        <td><span class="pill ${s.online ? "" : "off"}"></span></td>
+        <td><span class="pill ${state === "off" ? "off" : state === "lost" ? "lost" : ""}"></span></td>
       </tr>`;
     }).join("");
   }
@@ -414,5 +427,5 @@ function connect() {
     renderTopology(snap);
   };
 }
-setupPreferredInput();
+setupTimecodeSettings();
 connect();

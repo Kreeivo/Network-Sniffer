@@ -105,7 +105,10 @@ python simulator.py
 
 A fake node called **PIXEL-NODE-1** appears with three universes of moving
 DMX at 40 fps, and the timecode panel starts rolling at 25 fps from two
-transports at once (Art-Net timecode and ipMIDI bus 1). Everything stays
+transports at once (Art-Net timecode and ipMIDI bus 1). `--fps 24`, `30`
+or `df` (29.97 drop-frame) changes the rate, and `--flag 24` makes the
+simulator lie in its rate flag so you can watch the inspector work out
+the real one. Everything stays
 on this machine — the Art-Net goes to 127.0.0.1 and the ipMIDI multicast
 is sent with TTL 0, so nothing touches your real network. Ctrl+C to stop.
 
@@ -118,6 +121,7 @@ python app.py --port 9000        # different dashboard port
 python app.py --no-lan-scan     # skip the ping/ARP sweep (Art-Net only)
 python app.py --poll-interval 10 # ArtPoll every 10 s instead of 5
 python app.py --preferred-mtc-ip 10.0.0.5   # headline this timecode master (see below)
+python app.py --mtc-hold 10      # keep the clock on a master for 10 s after signal loss
 python app.py --ipmidi-buses 8   # watch ipMIDI buses 1-8 (default 1-4)
 python app.py --rtp-midi         # also listen on RTP-MIDI ports 5004/5005
 python app.py --no-mdns          # don't listen for network-MIDI announcements
@@ -147,8 +151,28 @@ python app.py --no-mtc           # turn the timecode listeners off entirely
   preference, not a lock: while that IP has signal the big clock follows
   it; if it goes quiet the clock falls back to another source and the
   panel says so in amber ("10.0.0.5 silent — showing 10.0.0.9"); when it
-  comes back, the clock returns to it. The setting is shared by every
-  open dashboard, so the FOH tablet shows the same choice as the PC. "Format" tells you whether a MIDI
+  comes back, the clock returns to it. The settings are shared by every
+  open dashboard, so the FOH tablet shows the same choice as the PC.
+- **Hold** (next to it, or `--mtc-hold`) is the switch-over delay: the
+  clock stays on its current master for that many seconds after the
+  signal stops — counting down in red ("signal lost — holding 3 s before
+  switching") — before another master may take over. The choice is made
+  once, on the server, and is sticky: two masters in lock-step, two
+  parked masters, or one device sending timecode on two transports will
+  never make the clock flip between them. Without a preference the
+  clock only leaves its master when it has been silent for the hold
+  time, or has stood still for the hold time while another master is
+  rolling.
+- **Frame rate is read from the timecode itself**, not from the sender's
+  rate flag: 24, 25 and 30 fps are told apart from the frame numbers
+  after a couple of seconds of rolling, and 29.97 drop-frame is
+  confirmed the first time a minute boundary rolls past (drop-frame
+  skips frames 00 and 01 there). Until then the flag's word is shown and
+  marked as such. A master whose flag disagrees with its numbers is still
+  displayed, at the real rate, with a ⚠ and the flagged value in the
+  tooltip — so a console set to 24 fps that is actually chasing 30 fps
+  timecode is caught rather than hidden. The rate the clock is running
+  at, in frames per wall-clock second, sits next to it while rolling. "Format" tells you whether a MIDI
   source is sending quarter-frame MTC (rolling) or full-frame messages
   (locate/park). The chips underneath are network-MIDI (RTP-MIDI)
   sessions that have announced themselves over mDNS, by their session
