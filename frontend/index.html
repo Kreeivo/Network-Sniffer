@@ -55,13 +55,21 @@
     <div class="panel-head">
       <h2>Timecode (MTC) on the network</h2>
       <div class="tc-head-right">
+        <div class="tc-settings">
         <label class="tc-pref" for="tc-pref-ip">
           <span>Preferred master</span>
           <input id="tc-pref-ip" class="mono" type="text" inputmode="decimal" size="15"
                  placeholder="any (auto)" autocomplete="off" spellcheck="false"
                  title="IP of the timecode master to headline. Not a lock: if it goes quiet the clock falls back to another source, and returns when it's back.">
+        </label>
+        <label class="tc-pref" for="tc-hold">
+          <span>Hold</span>
+          <input id="tc-hold" class="mono short" type="number" min="1" max="120" step="1" value="5"
+                 title="How long the clock stays on its master after the signal stops before another master may take over (seconds).">
+          <span>s</span>
           <span class="tc-pref-msg" id="tc-pref-msg"></span>
         </label>
+        </div>
         <span class="hint" id="tc-listeners">listening…</span>
       </div>
     </div>

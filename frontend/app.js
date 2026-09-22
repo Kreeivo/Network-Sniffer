@@ -116,72 +116,158 @@ function renderUniverses(unis) {
 
 /* ---------------- timecode (MTC) panel ---------------- */
 
-let tcLeadKey = null;
-let tcPrefPending = false;   // an edit is being sent; don't overwrite the box
-let tcPrefInvalid = false;   // box holds a rejected entry; leave it (and the error) until edited
+/* The headline master is chosen server-side (sticky, with a hold time) so
+   every open dashboard shows the same one and nothing flip-flops here.
+   The two settings boxes post to the server for the same reason. */
+const tcSettings = { pending: false, invalid: null };   // invalid: id of a box holding a rejected entry
 
-/* Preferred-master box: sent to the server so every open dashboard (the
-   FOH tablet included) headlines the same source. */
-function setupPreferredInput() {
-  const box = $("tc-pref-ip");
-  const msg = $("tc-pref-msg");
-  const send = async () => {
-    const ip = box.value.trim();
-    if (ip && !/^(\d{1,3})(\.\d{1,3}){3}$/.test(ip)) {
-      tcPrefInvalid = true;
-      box.classList.add("bad");
-      msg.textContent = "not an IPv4 address";
-      msg.className = "tc-pref-msg bad";
+function tcSetError(box, msg, text) {
+  tcSettings.invalid = box.id;
+  box.classList.add("bad");
+  msg.textContent = text;
+  msg.className = "tc-pref-msg bad";
+}
+
+async function tcPostSettings(payload, box, msg) {
+  tcSettings.pending = true;
+  try {
+    const r = await fetch("/api/timecode/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+    tcSettings.invalid = null;
+    box.classList.remove("bad");
+  } catch (e) {
+    tcSetError(box, msg, String(e.message || e));
+  } finally {
+    tcSettings.pending = false;
+  }
+}
+
+function setupTimecodeSettings() {
+  const ipBox = $("tc-pref-ip"), holdBox = $("tc-hold"), msg = $("tc-pref-msg");
+  const sendIp = () => {
+    const ip = ipBox.value.trim();
+    if (ip && !/^(\d{1,3})(\.\d{1,3}){3}$/.test(ip)) return tcSetError(ipBox, msg, "not an IPv4 address");
+    ipBox.value = ip;
+    return tcPostSettings({ preferred_ip: ip }, ipBox, msg);
+  };
+  const sendHold = () => {
+    const hold = Number(holdBox.value);
+    if (!(hold >= 1 && hold <= 120)) return tcSetError(holdBox, msg, "hold must be 1–120 s");
+    return tcPostSettings({ hold }, holdBox, msg);
+  };
+  for (const [box, send] of [[ipBox, sendIp], [holdBox, sendHold]]) {
+    box.addEventListener("change", send);
+    box.addEventListener("input", () => {
+      if (tcSettings.invalid === box.id) tcSettings.invalid = null;
+      box.classList.remove("bad");
+    });
+    box.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); box.blur(); } });
+  }
+}
+
+/* Sync a settings box from the snapshot unless the operator is using it. */
+function tcSyncBox(box, value) {
+  if (tcSettings.pending || tcSettings.invalid === box.id || document.activeElement === box) return;
+  if (box.value !== String(value)) { box.value = value; box.classList.remove("bad"); }
+}
+
+/* ---- flywheel: run the clock between snapshots at the real frame rate ----
+   Snapshots arrive twice a second; a 25 fps clock updated at 2 Hz jumps
+   twelve frames at a time. Instead each source's last frame and its age
+   anchor a local clock that advances at the detected rate, exactly like a
+   hardware timecode display freewheeling between reads. Every snapshot
+   re-anchors, but only if the local clock has drifted by more than a
+   frame, so a well-behaved stream never visibly jumps. */
+
+function tcCount([h, m, s, f], n, drop) {
+  const mins = h * 60 + m;
+  let c = (mins * 60 + s) * n + f;
+  if (drop && n === 30) c -= 2 * (mins - Math.floor(mins / 10));   // frames that never existed
+  return c;
+}
+function tcFromCount(c, n, drop) {
+  const df = drop && n === 30;
+  const day = 24 * 3600 * n - (df ? 2 * (1440 - 144) : 0);
+  c = ((c % day) + day) % day;
+  if (df) {
+    const d = Math.floor(c / 17982), mm = c % 17982;
+    c += 18 * d + (mm < 2 ? 0 : 2 * Math.floor((mm - 2) / 1798));
+  }
+  const p2 = (x) => String(x).padStart(2, "0");
+  return `${p2(Math.floor(c / (3600 * n)) % 24)}:${p2(Math.floor(c / (60 * n)) % 60)}:${p2(Math.floor(c / n) % 60)}:${p2(c % n)}`;
+}
+function tcFps(base) {
+  return base.nominal === 30 && base.drop ? 30000 / 1001 : base.nominal;
+}
+function tcPredictCount(base, nowMs) {
+  return Math.floor(base.countF + ((nowMs - base.at) / 1000) * base.fpsEff);
+}
+
+const tcFly = { bases: new Map(), cells: new Map(), clockKey: null, lastText: new Map() };
+const TC_SLEW_MAX = 0.04;      // at most ±4 % rate change to absorb drift
+const TC_JUMP_FRAMES = 3;      // further out than this is a locate: re-sync hard
+
+/* Reconcile a source's local clock with the snapshot. Rather than stepping
+   the phase (which shows as a skipped or repeated frame) the clock's rate
+   is trimmed by a few percent until the drift is gone, so frame periods
+   stretch imperceptibly and the count still rises by exactly one each
+   time. Only a real jump, e.g. the master locating, re-syncs hard. */
+function tcAnchor(s, nowMs) {
+  const fps = tcFps({ nominal: s.nominal, drop: s.drop_frame });
+  const serverF = tcCount(s.tc_parts, s.nominal, s.drop_frame) + s.tc_age * fps;
+  const old = tcFly.bases.get(s.key);
+  if (old && old.running && s.running && old.nominal === s.nominal && old.drop === s.drop_frame) {
+    const cur = old.countF + ((nowMs - old.at) / 1000) * old.fpsEff;
+    const drift = cur - serverF;                     // + = local clock ahead
+    if (Math.abs(drift) <= TC_JUMP_FRAMES) {
+      old.countF = cur; old.at = nowMs; old.text = s.timecode;
+      const k = Math.max(-TC_SLEW_MAX, Math.min(TC_SLEW_MAX, drift * 0.04));
+      old.fpsEff = fps * (1 - k);
       return;
     }
-    tcPrefInvalid = false;
-    box.classList.remove("bad");
-    tcPrefPending = true;
-    try {
-      const r = await fetch("/api/timecode/preferred", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ip }),
-      });
-      if (!r.ok) throw new Error((await r.json()).error || r.statusText);
-      box.value = ip;
-    } catch (e) {
-      tcPrefInvalid = true;
-      box.classList.add("bad");
-      msg.textContent = String(e.message || e);
-      msg.className = "tc-pref-msg bad";
-    } finally {
-      tcPrefPending = false;
-    }
-  };
-  box.addEventListener("change", send);
-  box.addEventListener("input", () => { tcPrefInvalid = false; box.classList.remove("bad"); });
-  box.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); box.blur(); } });
-}
-
-/* Pick the source to headline.  Preference first (while it has signal —
-   rolling or holding), otherwise stay with whatever we showed last if it
-   is still rolling, otherwise the longest-established rolling source,
-   otherwise the most recently heard.  Returns {lead, fallback}. */
-function chooseLead(sources, preferredIp) {
-  const keyOf = (s) => `${s.transport}|${s.ip}`;
-  if (preferredIp) {
-    const mine = sources.filter((s) => s.ip === preferredIp && s.online);
-    const pick = mine.find((s) => s.running && keyOf(s) === tcLeadKey)
-              || mine.find((s) => s.running)
-              || mine[0];
-    if (pick) return { lead: pick, fallback: false };
   }
-  const rolling = sources.filter((s) => s.running);
-  const lead = rolling.find((s) => keyOf(s) === tcLeadKey)
-            || rolling.slice().sort((a, b) => a.first_seen - b.first_seen)[0]
-            || sources[0];
-  return { lead, fallback: !!(preferredIp && lead) };
+  tcFly.bases.set(s.key, {
+    countF: serverF, at: nowMs, fpsEff: fps,
+    nominal: s.nominal, drop: s.drop_frame, running: s.running, text: s.timecode,
+  });
 }
 
+function tcPaint(nowMs) {
+  const paint = (key, el, slot) => {
+    const base = tcFly.bases.get(key);
+    if (!base || !el) return;
+    const text = base.running ? tcFromCount(tcPredictCount(base, nowMs), base.nominal, base.drop) : base.text;
+    if (tcFly.lastText.get(slot) !== text) { el.textContent = text; tcFly.lastText.set(slot, text); }
+  };
+  if (tcFly.clockKey) paint(tcFly.clockKey, $("tc-clock"), "clock");
+  for (const [key, el] of tcFly.cells) paint(key, el, key);
+}
+function tcTick(nowMs) {
+  tcPaint(nowMs);
+  requestAnimationFrame(tcTick);
+}
+requestAnimationFrame(tcTick);
+
+/* rolling / holding (parked) / lost (in the hold window) / off */
 function tcStateOf(s) {
   if (!s.online) return "off";
+  if (!s.fresh) return "lost";
   return s.running ? "running" : "holding";
+}
+
+function fmtRate(s) {
+  // Detected from the frame numbers on the wire, or the sender's flag
+  // until enough has rolled to tell.
+  if (s.rate_mismatch) {
+    return `<span class="rate-bad" title="Sender flags ${esc(s.rate_flagged)} but the frame numbers say ${esc(s.rate)}">${esc(s.rate)} ⚠</span>`;
+  }
+  if (s.rate_detected && s.rate_note) return `<span title="${esc(s.rate_note)}">${esc(s.rate)} <span class="rate-flag">*</span></span>`;
+  if (s.rate_detected) return `<span title="Measured from the timecode itself">${esc(s.rate)}</span>`;
+  return `<span class="rate-flag" title="From the sender's rate flag — confirming once it rolls">${esc(s.rate)}</span>`;
 }
 
 function renderTimecode(snap) {
@@ -192,30 +278,33 @@ function renderTimecode(snap) {
     ? "listening: " + listeners.join(" · ") : "timecode listeners disabled";
 
   const preferredIp = snap.preferred_tc_ip || "";
-  const box = $("tc-pref-ip");
-  if (!tcPrefPending && !tcPrefInvalid && document.activeElement !== box && box.value !== preferredIp) {
-    box.value = preferredIp;
-    box.classList.remove("bad");
-  }
+  const hold = snap.tc_hold || 5;
+  tcSyncBox($("tc-pref-ip"), preferredIp);
+  tcSyncBox($("tc-hold"), hold);
 
-  const { lead, fallback } = chooseLead(sources, preferredIp);
-  tcLeadKey = lead ? `${lead.transport}|${lead.ip}` : null;
+  const nowMs = performance.now();
+  const live = new Set(sources.map((s) => s.key));
+  for (const s of sources) tcAnchor(s, nowMs);
+  for (const key of [...tcFly.bases.keys()]) if (!live.has(key)) tcFly.bases.delete(key);
+
+  const lead = sources.find((s) => s.key === snap.tc_lead) || null;
   const msg = $("tc-pref-msg");
-  if (tcPrefInvalid) {
+  if (tcSettings.invalid) {
     // keep the rejected entry and its error on screen
   } else if (!preferredIp) {
     msg.textContent = ""; msg.className = "tc-pref-msg";
-  } else if (fallback) {
+  } else if (snap.tc_lead_reason === "fallback" && lead) {
     msg.textContent = `${preferredIp} silent — showing ${lead.ip}`;
     msg.className = "tc-pref-msg fallback";
-  } else if (!lead) {
-    msg.textContent = `waiting for ${preferredIp}`;
-    msg.className = "tc-pref-msg";
-  } else {
+  } else if (snap.tc_lead_reason === "preferred") {
     msg.textContent = "✓ preferred"; msg.className = "tc-pref-msg";
+  } else {
+    msg.textContent = `waiting for ${preferredIp}`; msg.className = "tc-pref-msg";
   }
-  hero.classList.remove("running", "holding");
+
+  hero.classList.remove("running", "holding", "lost");
   if (!lead) {
+    tcFly.clockKey = null;
     $("tc-clock").textContent = "--:--:--:--";
     $("tc-source").textContent = "No timecode seen yet";
     $("tc-detail").textContent = "Start your timecode master — Art-Net timecode and ipMIDI appear here automatically.";
@@ -223,12 +312,18 @@ function renderTimecode(snap) {
   } else {
     const state = tcStateOf(lead);
     if (state !== "off") hero.classList.add(state);
-    $("tc-clock").textContent = lead.timecode;
+    tcFly.clockKey = lead.key;                    // the flywheel paints the digits
     $("tc-source").textContent = lead.name ? `${lead.name}  (${lead.ip})` : lead.ip;
-    $("tc-detail").textContent = `${lead.transport} · ${lead.rate} · ${lead.kind}`;
+    const rateTxt = lead.rate_mismatch ? `${lead.rate} ⚠ (flagged ${lead.rate_flagged})`
+                  : lead.rate_detected && lead.rate_note ? `${lead.rate} (${lead.rate_note})`
+                  : lead.rate_detected ? `${lead.rate} (auto-detected)` : `${lead.rate} (flag)`;
+    const speed = lead.running && lead.measured_fps ? ` · running ${lead.measured_fps.toFixed(2)} fps` : "";
+    $("tc-detail").textContent = `${lead.transport} · ${rateTxt}${speed} · ${lead.kind}`;
+    const left = Math.max(0, hold - lead.since_seen);
     $("tc-state-text").textContent =
       state === "running" ? "rolling" :
       state === "holding" ? "holding — master is sending but the clock isn't moving" :
+      state === "lost"    ? `signal lost — holding ${left.toFixed(0)} s before switching` :
       "signal lost";
   }
 
@@ -239,19 +334,24 @@ function renderTimecode(snap) {
     tbody.innerHTML = sources.map((s) => {
       const state = tcStateOf(s);
       const cls = state === "running" ? "" : state === "holding" ? " hold" : " off";
+      const isLead = s.key === snap.tc_lead;
       return `
-      <tr>
-        <td>${esc(s.name || "—")}${s.ip === preferredIp ? `<span class="tag">preferred</span>` : ""}</td>
+      <tr class="${isLead ? "lead" : ""}">
+        <td>${esc(s.name || "—")}${s.ip === preferredIp ? `<span class="tag">preferred</span>` : ""}${isLead ? `<span class="tag lead">on clock</span>` : ""}</td>
         <td class="mono">${esc(s.ip)}</td>
         <td>${esc(s.transport)}</td>
-        <td class="mono tc-cell${cls}"><b>${esc(s.timecode)}</b></td>
-        <td class="mono">${esc(s.rate)}</td>
+        <td class="mono tc-cell${cls}"><b data-key="${esc(s.key)}">${esc(s.timecode)}</b></td>
+        <td class="mono">${fmtRate(s)}</td>
         <td>${esc(s.kind)}</td>
         <td class="mono">${s.updates_per_sec.toFixed(1)} /s</td>
-        <td><span class="pill ${s.online ? "" : "off"}"></span></td>
+        <td><span class="pill ${state === "off" ? "off" : state === "lost" ? "lost" : ""}"></span></td>
       </tr>`;
     }).join("");
   }
+
+  tcFly.cells.clear();
+  for (const el of tbody.querySelectorAll("b[data-key]")) { tcFly.cells.set(el.dataset.key, el); tcFly.lastText.delete(el.dataset.key); }
+  tcPaint(performance.now());   // never leave the server's older string on screen
 
   const eps = snap.midi_endpoints || [];
   $("midi-endpoints").innerHTML = eps.length
@@ -414,5 +514,5 @@ function connect() {
     renderTopology(snap);
   };
 }
-setupPreferredInput();
+setupTimecodeSettings();
 connect();

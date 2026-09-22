@@ -9,12 +9,16 @@ transports at once:
     * Art-Net timecode (ArtTimeCode) from the same fake node
     * ipMIDI bus 1 quarter-frame MTC (multicast 225.0.0.37:21928)
 
-    python simulator.py
+    python simulator.py                # 25 fps
+    python simulator.py --fps 30       # 24, 25, 30 or df (29.97 drop-frame)
+    python simulator.py --fps 30 --flag 24   # lie in the rate flag, to see
+                                             # the inspector detect the real rate
 
 Everything stays on this machine - Art-Net goes to 127.0.0.1 and the
 ipMIDI multicast is sent with TTL 0, which never leaves the host.
 Stop it with Ctrl+C.
 """
+import argparse
 import socket
 import struct
 import time
@@ -26,8 +30,12 @@ OP_TIMECODE = 0x9700
 TARGET = ("127.0.0.1", 6454)
 IPMIDI = ("225.0.0.37", 21928)          # bus 1
 
-TC_FPS = 25                             # MTC rate code 1 = 25 fps (EBU)
-TC_RATE_CODE = 1
+RATES = {"24": (24.0, 24, 0), "25": (25.0, 25, 1),
+         "30": (30.0, 30, 3), "df": (30000 / 1001, 30, 2)}   # real fps, nominal, MTC code
+TC_FPS = 25.0                           # real frames per second
+TC_NOMINAL = 25                         # frame numbers run 0..TC_NOMINAL-1
+TC_RATE_CODE = 1                        # what we put in the rate flag
+TC_DROP = False
 TC_START = (0, 59, 50, 0)               # roll from 00:59:50:00 so it crosses the hour
 
 
@@ -56,10 +64,16 @@ def dmx(universe, seq):
 
 
 def frames_to_tc(total):
-    f = total % TC_FPS
-    s = (total // TC_FPS) % 60
-    m = (total // (TC_FPS * 60)) % 60
-    h = (total // (TC_FPS * 3600)) % 24
+    n = TC_NOMINAL
+    if TC_DROP:
+        # 29.97 drop-frame: skip frame numbers 0 and 1 at every minute that
+        # isn't a multiple of ten (17982 frames per ten minutes).
+        d, m = divmod(total, 17982)
+        total = total + 18 * d + (0 if m < 2 else 2 * ((m - 2) // 1798))
+    f = total % n
+    s = (total // n) % 60
+    m = (total // (n * 60)) % 60
+    h = (total // (n * 3600)) % 24
     return h, m, s, f
 
 
@@ -77,6 +91,18 @@ def mtc_quarter_frames(h, m, s, f):
 
 
 def main():
+    global TC_FPS, TC_NOMINAL, TC_RATE_CODE, TC_DROP
+    ap = argparse.ArgumentParser(description="Art-Net + MTC simulator")
+    ap.add_argument("--fps", choices=sorted(RATES), default="25",
+                    help="timecode rate: 24, 25, 30 or df (29.97 drop-frame)")
+    ap.add_argument("--flag", choices=sorted(RATES), default=None,
+                    help="put a different rate in the MTC rate flag (to test detection)")
+    a = ap.parse_args()
+    TC_FPS, TC_NOMINAL, TC_RATE_CODE = RATES[a.fps]
+    TC_DROP = a.fps == "df"
+    if a.flag:
+        TC_RATE_CODE = RATES[a.flag][2]
+
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     mc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     mc.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 0)   # host only
@@ -88,12 +114,14 @@ def main():
                       out_unis=(0, 1, 2))
     print("Simulator running - sending fake Art-Net to 127.0.0.1:6454")
     print("and MTC quarter-frames to ipMIDI bus 1 (225.0.0.37:21928, TTL 0).")
-    print("Open the dashboard: PIXEL-NODE-1 with 3 universes, timecode rolling at 25 fps.")
+    print(f"Open the dashboard: PIXEL-NODE-1 with 3 universes, timecode rolling at "
+          f"{a.fps.replace('df', '29.97 drop')} fps"
+          + (f" (flagged as {a.flag.replace('df', '29.97 drop')})" if a.flag else "") + ".")
     print("Ctrl+C to stop.")
     seq = 0
     last_reply = 0.0
     h, m, sec, f = TC_START
-    tc_frame = ((h * 60 + m) * 60 + sec) * TC_FPS + f
+    tc_frame = ((h * 60 + m) * 60 + sec) * TC_NOMINAL + f
     tc_next = time.time()
     qf_index = 0
     try:
