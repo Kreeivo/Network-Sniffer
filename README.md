@@ -117,6 +117,7 @@ is sent with TTL 0, so nothing touches your real network. Ctrl+C to stop.
 python app.py --port 9000        # different dashboard port
 python app.py --no-lan-scan     # skip the ping/ARP sweep (Art-Net only)
 python app.py --poll-interval 10 # ArtPoll every 10 s instead of 5
+python app.py --preferred-mtc-ip 10.0.0.5   # headline this timecode master (see below)
 python app.py --ipmidi-buses 8   # watch ipMIDI buses 1-8 (default 1-4)
 python app.py --rtp-midi         # also listen on RTP-MIDI ports 5004/5005
 python app.py --no-mdns          # don't listen for network-MIDI announcements
@@ -140,7 +141,14 @@ python app.py --no-mtc           # turn the timecode listeners off entirely
   is still sending but the clock isn't moving (a parked deck or a stopped
   transport); grey means the signal has gone. The table below lists every
   master by transport, so you can see at a glance whether your Art-Net
-  timecode and your ipMIDI feed agree. "Format" tells you whether a MIDI
+  timecode and your ipMIDI feed agree. If more than one master is on the
+  wire, type the IP of the one you care about into **Preferred master**
+  (top right of the panel, or `--preferred-mtc-ip` at launch). It's a
+  preference, not a lock: while that IP has signal the big clock follows
+  it; if it goes quiet the clock falls back to another source and the
+  panel says so in amber ("10.0.0.5 silent — showing 10.0.0.9"); when it
+  comes back, the clock returns to it. The setting is shared by every
+  open dashboard, so the FOH tablet shows the same choice as the PC. "Format" tells you whether a MIDI
   source is sending quarter-frame MTC (rolling) or full-frame messages
   (locate/park). The chips underneath are network-MIDI (RTP-MIDI)
   sessions that have announced themselves over mDNS, by their session

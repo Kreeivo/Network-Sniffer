@@ -204,6 +204,39 @@ h2 { font-size: 14px; font-weight: 650; margin: 0; }
 .chip.in  { border-color: rgba(67,198,192,.5);  color: var(--cyan); }
 
 /* ---------- timecode ---------- */
+.tc-head-right {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 4px;
+  min-width: 0;
+}
+.tc-pref {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 11.5px; color: var(--text-dim);
+}
+.tc-pref input {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 2px 7px;
+  width: 132px;
+}
+.tc-pref input:focus { outline: none; border-color: var(--violet); }
+.tc-pref input.bad { border-color: var(--red); }
+.tc-pref-msg { font-size: 11px; min-width: 0; white-space: nowrap; }
+.tc-pref-msg.fallback { color: var(--amber); }
+.tc-pref-msg.bad { color: var(--red); }
+.tag {
+  display: inline-block;
+  font-size: 10px; font-weight: 600; letter-spacing: .04em;
+  padding: 0 5px; margin-left: 6px;
+  border-radius: 3px; vertical-align: 1px;
+  border: 1px solid rgba(181,140,255,.5); color: var(--violet);
+}
+@media (max-width: 980px) {
+  .tc-head-right { align-items: flex-start; }
+  .panel-head { flex-wrap: wrap; }
+}
 .tc-hero {
   display: flex;
   align-items: center;

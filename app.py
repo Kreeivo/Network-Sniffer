@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
 
 try:
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
     import uvicorn
@@ -610,6 +610,10 @@ class Engine:
         self.midi_decoders: Dict[str, MidiTimecodeDecoder] = {}
         self.midi_endpoints: Dict[str, MidiEndpoint] = {}
         self.listeners: List[str] = []
+        # Which master the dashboard should headline when several are on
+        # the wire. A preference, not a lock: the UI falls back to another
+        # source while this one is silent and returns to it when it is back.
+        self.preferred_tc_ip: str = ""
         self.started = now()
         self.local_ips: List[str] = []
 
@@ -765,6 +769,7 @@ class Engine:
                                sorted(self.midi_endpoints.values(),
                                       key=lambda e: (e.name.lower(), e.ip))],
             "timecode_listeners": self.listeners,
+            "preferred_tc_ip": self.preferred_tc_ip,
         }
 
     def _tc_dict(self, src: TimecodeSource) -> dict:
@@ -1056,7 +1061,15 @@ FRONTEND = Path(__file__).parent / "frontend"
 engine = Engine()
 transport_ref: dict = {}
 ARGS = argparse.Namespace(lan_scan=True, poll_interval=5.0,
-                          mtc=True, ipmidi_buses=4, mdns=True, rtp_midi=False)
+                          mtc=True, ipmidi_buses=4, mdns=True, rtp_midi=False,
+                          preferred_tc_ip="")
+
+
+def valid_ipv4(text: str) -> bool:
+    try:
+        return isinstance(ipaddress.ip_address(text), ipaddress.IPv4Address)
+    except ValueError:
+        return False
 
 
 async def task_artpoll():
@@ -1094,6 +1107,7 @@ async def task_prune():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     engine.local_ips = [ip for ip, _ in list_local_networks()]
+    engine.preferred_tc_ip = ARGS.preferred_tc_ip
     transport_ref["t"] = await open_artnet_socket(engine)
     extra_transports = await open_mtc_listeners(engine) if ARGS.mtc else []
     tasks = [asyncio.create_task(task_artpoll()),
@@ -1116,6 +1130,17 @@ app = FastAPI(title="DMX/Art-Net Network Inspector", lifespan=lifespan)
 @app.get("/api/snapshot")
 async def api_snapshot():
     return JSONResponse(engine.snapshot())
+
+
+@app.post("/api/timecode/preferred")
+async def api_set_preferred_tc(body: dict = Body(...)):
+    """Set (or clear, with "") the preferred timecode master's IP."""
+    ip = str(body.get("ip", "")).strip()
+    if ip and not valid_ipv4(ip):
+        return JSONResponse({"ok": False, "error": "not a valid IPv4 address"},
+                            status_code=400)
+    engine.preferred_tc_ip = ip
+    return JSONResponse({"ok": True, "preferred_tc_ip": ip})
 
 
 @app.websocket("/ws")
@@ -1154,6 +1179,10 @@ def main():
                     help="listen on ipMIDI buses 1..N (default 4, max 20)")
     ap.add_argument("--no-mdns", action="store_true",
                     help="don't listen for mDNS network-MIDI announcements")
+    ap.add_argument("--preferred-mtc-ip", default="", metavar="IP",
+                    help="timecode master to headline on the dashboard when "
+                         "several are on the wire (falls back to another "
+                         "source while it is silent); can also be set in the UI")
     ap.add_argument("--rtp-midi", action="store_true",
                     help="also listen on the RTP-MIDI/AppleMIDI ports 5004/5005 "
                          "(only useful when this machine is a session endpoint "
@@ -1165,6 +1194,9 @@ def main():
     ARGS.ipmidi_buses = max(0, min(20, a.ipmidi_buses))
     ARGS.mdns = not a.no_mdns
     ARGS.rtp_midi = a.rtp_midi
+    if a.preferred_mtc_ip and not valid_ipv4(a.preferred_mtc_ip):
+        ap.error(f"--preferred-mtc-ip: '{a.preferred_mtc_ip}' is not an IPv4 address")
+    ARGS.preferred_tc_ip = a.preferred_mtc_ip
 
     local = engine.local_ips or [ip for ip, _ in list_local_networks()]
     print("=" * 62)

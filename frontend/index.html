@@ -54,7 +54,16 @@
   <section class="panel" id="timecode-panel">
     <div class="panel-head">
       <h2>Timecode (MTC) on the network</h2>
-      <span class="hint" id="tc-listeners">listening…</span>
+      <div class="tc-head-right">
+        <label class="tc-pref" for="tc-pref-ip">
+          <span>Preferred master</span>
+          <input id="tc-pref-ip" class="mono" type="text" inputmode="decimal" size="15"
+                 placeholder="any (auto)" autocomplete="off" spellcheck="false"
+                 title="IP of the timecode master to headline. Not a lock: if it goes quiet the clock falls back to another source, and returns when it's back.">
+          <span class="tc-pref-msg" id="tc-pref-msg"></span>
+        </label>
+        <span class="hint" id="tc-listeners">listening…</span>
+      </div>
     </div>
     <div class="tc-hero">
       <div class="tc-clock mono" id="tc-clock">--:--:--:--</div>

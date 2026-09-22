@@ -117,6 +117,67 @@ function renderUniverses(unis) {
 /* ---------------- timecode (MTC) panel ---------------- */
 
 let tcLeadKey = null;
+let tcPrefPending = false;   // an edit is being sent; don't overwrite the box
+let tcPrefInvalid = false;   // box holds a rejected entry; leave it (and the error) until edited
+
+/* Preferred-master box: sent to the server so every open dashboard (the
+   FOH tablet included) headlines the same source. */
+function setupPreferredInput() {
+  const box = $("tc-pref-ip");
+  const msg = $("tc-pref-msg");
+  const send = async () => {
+    const ip = box.value.trim();
+    if (ip && !/^(\d{1,3})(\.\d{1,3}){3}$/.test(ip)) {
+      tcPrefInvalid = true;
+      box.classList.add("bad");
+      msg.textContent = "not an IPv4 address";
+      msg.className = "tc-pref-msg bad";
+      return;
+    }
+    tcPrefInvalid = false;
+    box.classList.remove("bad");
+    tcPrefPending = true;
+    try {
+      const r = await fetch("/api/timecode/preferred", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ip }),
+      });
+      if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+      box.value = ip;
+    } catch (e) {
+      tcPrefInvalid = true;
+      box.classList.add("bad");
+      msg.textContent = String(e.message || e);
+      msg.className = "tc-pref-msg bad";
+    } finally {
+      tcPrefPending = false;
+    }
+  };
+  box.addEventListener("change", send);
+  box.addEventListener("input", () => { tcPrefInvalid = false; box.classList.remove("bad"); });
+  box.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); box.blur(); } });
+}
+
+/* Pick the source to headline.  Preference first (while it has signal —
+   rolling or holding), otherwise stay with whatever we showed last if it
+   is still rolling, otherwise the longest-established rolling source,
+   otherwise the most recently heard.  Returns {lead, fallback}. */
+function chooseLead(sources, preferredIp) {
+  const keyOf = (s) => `${s.transport}|${s.ip}`;
+  if (preferredIp) {
+    const mine = sources.filter((s) => s.ip === preferredIp && s.online);
+    const pick = mine.find((s) => s.running && keyOf(s) === tcLeadKey)
+              || mine.find((s) => s.running)
+              || mine[0];
+    if (pick) return { lead: pick, fallback: false };
+  }
+  const rolling = sources.filter((s) => s.running);
+  const lead = rolling.find((s) => keyOf(s) === tcLeadKey)
+            || rolling.slice().sort((a, b) => a.first_seen - b.first_seen)[0]
+            || sources[0];
+  return { lead, fallback: !!(preferredIp && lead) };
+}
 
 function tcStateOf(s) {
   if (!s.online) return "off";
@@ -130,15 +191,29 @@ function renderTimecode(snap) {
   $("tc-listeners").textContent = listeners.length
     ? "listening: " + listeners.join(" · ") : "timecode listeners disabled";
 
-  // Headline clock: stick with the master we showed last time while it is
-  // still rolling, so two masters in lock-step don't flicker; otherwise the
-  // longest-established rolling source, else whoever we heard from last
-  // (the list arrives sorted by last_seen).
-  const keyOf = (s) => `${s.transport}|${s.ip}`;
-  const rolling = sources.filter((s) => s.running);
-  let lead = rolling.find((s) => keyOf(s) === tcLeadKey);
-  if (!lead) lead = rolling.sort((a, b) => a.first_seen - b.first_seen)[0] || sources[0];
-  tcLeadKey = lead ? keyOf(lead) : null;
+  const preferredIp = snap.preferred_tc_ip || "";
+  const box = $("tc-pref-ip");
+  if (!tcPrefPending && !tcPrefInvalid && document.activeElement !== box && box.value !== preferredIp) {
+    box.value = preferredIp;
+    box.classList.remove("bad");
+  }
+
+  const { lead, fallback } = chooseLead(sources, preferredIp);
+  tcLeadKey = lead ? `${lead.transport}|${lead.ip}` : null;
+  const msg = $("tc-pref-msg");
+  if (tcPrefInvalid) {
+    // keep the rejected entry and its error on screen
+  } else if (!preferredIp) {
+    msg.textContent = ""; msg.className = "tc-pref-msg";
+  } else if (fallback) {
+    msg.textContent = `${preferredIp} silent — showing ${lead.ip}`;
+    msg.className = "tc-pref-msg fallback";
+  } else if (!lead) {
+    msg.textContent = `waiting for ${preferredIp}`;
+    msg.className = "tc-pref-msg";
+  } else {
+    msg.textContent = "✓ preferred"; msg.className = "tc-pref-msg";
+  }
   hero.classList.remove("running", "holding");
   if (!lead) {
     $("tc-clock").textContent = "--:--:--:--";
@@ -166,7 +241,7 @@ function renderTimecode(snap) {
       const cls = state === "running" ? "" : state === "holding" ? " hold" : " off";
       return `
       <tr>
-        <td>${esc(s.name || "—")}</td>
+        <td>${esc(s.name || "—")}${s.ip === preferredIp ? `<span class="tag">preferred</span>` : ""}</td>
         <td class="mono">${esc(s.ip)}</td>
         <td>${esc(s.transport)}</td>
         <td class="mono tc-cell${cls}"><b>${esc(s.timecode)}</b></td>
@@ -339,4 +414,5 @@ function connect() {
     renderTopology(snap);
   };
 }
+setupPreferredInput();
 connect();
