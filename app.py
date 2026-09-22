@@ -47,9 +47,18 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+try:
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.staticfiles import StaticFiles
+    import uvicorn
+except ImportError as _missing:
+    import sys
+    sys.exit(
+        f"\nMissing dependency: {_missing.name}\n"
+        "Install the requirements with the SAME Python you are running this with:\n\n"
+        f"    {sys.executable} -m pip install -r requirements.txt\n"
+    )
 
 try:
     import psutil
@@ -1129,7 +1138,6 @@ app.mount("/static", StaticFiles(directory=str(FRONTEND)), name="static")
 
 
 def main():
-    import uvicorn
     ap = argparse.ArgumentParser(description="DMX/Art-Net Network Inspector")
     ap.add_argument("--port", type=int, default=8058,
                     help="dashboard web port (default 8058)")
