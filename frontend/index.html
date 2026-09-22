@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Art-Net Inspector</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='42' fill='%23FFB020'/></svg>">
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="led" id="conn-led"></span>
+    <h1>Art-Net Inspector</h1>
+    <span class="sub" id="conn-text">connecting…</span>
+  </div>
+  <div class="hero-stats">
+    <div class="stat">
+      <div class="stat-value mono" id="stat-bps">0 B/s</div>
+      <div class="stat-label">network traffic</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value mono" id="stat-pps">0</div>
+      <div class="stat-label">packets / s</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value mono" id="stat-uptime">0:00</div>
+      <div class="stat-label">monitoring for</div>
+    </div>
+    <canvas id="spark" width="260" height="54"></canvas>
+  </div>
+</header>
+
+<main>
+  <section class="panel" id="topology-panel">
+    <div class="panel-head">
+      <h2>Live network map</h2>
+      <span class="hint">line glow = data flowing right now</span>
+    </div>
+    <svg id="topo" viewBox="0 0 900 460" preserveAspectRatio="xMidYMid meet"></svg>
+  </section>
+
+  <section class="panel" id="devices-panel">
+    <div class="panel-head">
+      <h2>Art-Net devices</h2>
+      <span class="hint" id="device-count"></span>
+    </div>
+    <div id="device-list" class="device-list">
+      <div class="empty">No Art-Net devices found yet. Polling the network every few seconds — replies appear here automatically.</div>
+    </div>
+  </section>
+
+  <section class="panel" id="universes-panel">
+    <div class="panel-head">
+      <h2>DMX universes on the wire</h2>
+      <span class="hint" id="universe-count"></span>
+    </div>
+    <table class="data-table" id="universe-table">
+      <thead>
+        <tr>
+          <th>Universe</th><th>From</th><th>Frame rate</th>
+          <th>Channels active</th><th>Bandwidth</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="empty-row"><td colspan="6">No ArtDmx traffic seen yet. Start output from your console and universes appear here live.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="panel" id="lan-panel">
+    <div class="panel-head">
+      <h2>Other devices on this network</h2>
+      <span class="hint">found by ping + ARP — a plain unmanaged switch has no IP address, so it can't appear here; managed switches do</span>
+    </div>
+    <table class="data-table" id="lan-table">
+      <thead>
+        <tr><th>Name</th><th>IP address</th><th>MAC</th><th>Vendor</th><th></th></tr>
+      </thead>
+      <tbody>
+        <tr class="empty-row"><td colspan="5">Scanning the subnet…</td></tr>
+      </tbody>
+    </table>
+  </section>
+</main>
+
+<footer>
+  Passive monitor — sends only ArtPoll discovery and pings, never DMX. Safe to run during a show alongside your console.
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
