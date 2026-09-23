@@ -111,14 +111,22 @@ python simulator.py
 ```
 
 A fake node called **PIXEL-NODE-1** appears with three universes of moving
-DMX at 40 fps, and the timecode panel starts rolling at 25 fps from two
-transports at once (Art-Net timecode and ipMIDI bus 1). `--fps 24`, `30`
-or `df` (29.97 drop-frame) changes the rate, and `--flag 24` makes the
-simulator lie in its rate flag so you can watch the inspector work out
-the real one. `--show-control` adds a fake ShowKontrol rig — a TCNet
-master and a grandMA3 slave, two CDJ-3000s and a DJM on Pro DJ Link, and
-OSC cues — each from its own 127.0.0.x address, so the show-control
-panel and the purple lines on the map light up too. Everything stays
+DMX at 40 fps; the timecode panel starts rolling at 25 fps from two
+transports at once (Art-Net timecode and ipMIDI bus 1); and a fake
+ShowKontrol rig — **SHOWKTRL** as the TCNet master with two layers
+running, a grandMA3 as a TCNet slave, two CDJ-3000s and a DJM on Pro DJ
+Link beating at 128 BPM, and OSC cues — each from its own 127.0.0.x
+address, so the show-control panel and the purple lines on the map light
+up too.
+
+**To change the timecode frame rate**, open `simulator.py` and edit the
+`SETTINGS` block at the very top — `TIMECODE_FPS = "25"` takes `"24"`,
+`"25"`, `"30"` or `"df"` (29.97 drop-frame). The same block has
+`TIMECODE_FLAG` (make the simulator lie in its rate flag so you can watch
+the inspector work out the real rate), `SHOW_CONTROL` and `DJ_BPM`.
+Command-line flags override the block for a one-off run:
+`python simulator.py --fps 30`, `--flag 24`, `--no-show-control`.
+Everything stays
 on this machine — the Art-Net goes to 127.0.0.1 and the ipMIDI multicast
 is sent with TTL 0, so nothing touches your real network. Ctrl+C to stop.
 

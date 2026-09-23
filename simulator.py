@@ -1,30 +1,66 @@
 """
-Art-Net + MTC traffic simulator - for testing the Inspector with NO hardware.
+Art-Net + MTC + show-control simulator - for testing the Inspector with
+NO hardware.
 
 Run this in a second terminal while app.py is running and the dashboard
-will light up with a fake node ("PIXEL-NODE-1"), three universes of moving
-DMX data at ~40 fps, and a timecode clock rolling at 25 fps on two
-transports at once:
+will light up with:
 
-    * Art-Net timecode (ArtTimeCode) from the same fake node
-    * ipMIDI bus 1 quarter-frame MTC (multicast 225.0.0.37:21928)
+    * a fake Art-Net node "PIXEL-NODE-1" with three universes of moving
+      DMX at ~40 fps
+    * a timecode clock rolling on two transports at once - Art-Net
+      timecode from that node, and ipMIDI bus 1 quarter-frame MTC
+      (multicast 225.0.0.37:21928)
+    * a fake ShowKontrol rig: "SHOWKTRL" as the TCNet master with two
+      layers running, a grandMA3 as a TCNet slave, two CDJ-3000s and a
+      DJM-900NXS2 on Pro DJ Link beating at 128 BPM, and OSC cues - so
+      the show-control panel and the purple lines on the map light up
 
-    python simulator.py                # 25 fps
-    python simulator.py --fps 30       # 24, 25, 30 or df (29.97 drop-frame)
+    python simulator.py
+
+>>> To change the timecode frame rate (or anything else), edit the
+>>> SETTINGS block just below - or override it from the command line:
+
+    python simulator.py --fps 30             # 24, 25, 30 or df (29.97 drop)
     python simulator.py --fps 30 --flag 24   # lie in the rate flag, to see
                                              # the inspector detect the real rate
-    python simulator.py --show-control       # also fake a ShowKontrol rig:
-                                             # TCNet master, two CDJs + DJM on
-                                             # Pro DJ Link, and OSC cues
+    python simulator.py --no-show-control    # Art-Net + timecode only
 
-Everything stays on this machine - Art-Net goes to 127.0.0.1 and the
-ipMIDI multicast is sent with TTL 0, which never leaves the host.
-Stop it with Ctrl+C.
+Everything stays on this machine - Art-Net goes to 127.0.0.1, the ipMIDI
+multicast is sent with TTL 0 (never leaves the host) and the show-control
+devices live on 127.0.0.x. Stop it with Ctrl+C.
 """
 import argparse
 import socket
 import struct
 import time
+
+# =========================================================================== #
+#                                                                             #
+#   SETTINGS  -  edit these to change what the simulator sends                #
+#                                                                             #
+# =========================================================================== #
+
+#   TIMECODE FRAME RATE.  One of:  "24"   "25"   "30"   "df"  (29.97 drop-frame)
+TIMECODE_FPS = "25"
+
+#   Rate written into the MTC / Art-Net rate flag. None = tell the truth.
+#   Set to e.g. "24" while TIMECODE_FPS is "30" to watch the inspector work
+#   out the real rate from the frame numbers and flag the mismatch.
+TIMECODE_FLAG = None
+
+#   Where the clock starts (hours, minutes, seconds, frames). The default
+#   rolls across the 01:00:00:00 hour boundary a few seconds in.
+TIMECODE_START = (0, 59, 50, 0)
+
+#   Fake a ShowKontrol rig (TCNet master + slave, CDJs + DJM on Pro DJ
+#   Link, OSC cues). Set False for Art-Net + timecode only.
+SHOW_CONTROL = True
+
+#   Tempo the fake CDJs beat at.
+DJ_BPM = 128.0
+
+# --- command-line flags (--fps, --flag, --no-show-control) override these --
+# =========================================================================== #
 
 ARTNET_ID = b"Art-Net\x00"
 OP_POLL_REPLY = 0x2100
@@ -35,11 +71,11 @@ IPMIDI = ("225.0.0.37", 21928)          # bus 1
 
 RATES = {"24": (24.0, 24, 0), "25": (25.0, 25, 1),
          "30": (30.0, 30, 3), "df": (30000 / 1001, 30, 2)}   # real fps, nominal, MTC code
+# Filled in from SETTINGS / the command line at start-up:
 TC_FPS = 25.0                           # real frames per second
 TC_NOMINAL = 25                         # frame numbers run 0..TC_NOMINAL-1
 TC_RATE_CODE = 1                        # what we put in the rate flag
 TC_DROP = False
-TC_START = (0, 59, 50, 0)               # roll from 00:59:50:00 so it crosses the hour
 
 
 def poll_reply(ip, short, long_, style, mac, out_unis=()):
@@ -169,14 +205,27 @@ def osc(address, *args):
 
 def main():
     global TC_FPS, TC_NOMINAL, TC_RATE_CODE, TC_DROP
-    ap = argparse.ArgumentParser(description="Art-Net + MTC simulator")
-    ap.add_argument("--fps", choices=sorted(RATES), default="25",
-                    help="timecode rate: 24, 25, 30 or df (29.97 drop-frame)")
+    ap = argparse.ArgumentParser(
+        description="Art-Net + MTC + show-control simulator. Defaults come from "
+                    "the SETTINGS block at the top of simulator.py.")
+    ap.add_argument("--fps", choices=sorted(RATES), default=None,
+                    help=f"timecode rate: 24, 25, 30 or df (29.97 drop-frame); "
+                         f"default from SETTINGS ({TIMECODE_FPS})")
     ap.add_argument("--flag", choices=sorted(RATES), default=None,
                     help="put a different rate in the MTC rate flag (to test detection)")
-    ap.add_argument("--show-control", action="store_true",
-                    help="also fake a ShowKontrol rig (TCNet, Pro DJ Link, OSC)")
+    sc = ap.add_mutually_exclusive_group()
+    sc.add_argument("--show-control", dest="show_control", action="store_true",
+                    default=SHOW_CONTROL, help="fake a ShowKontrol rig (TCNet, Pro DJ Link, OSC)")
+    sc.add_argument("--no-show-control", dest="show_control", action="store_false",
+                    help="Art-Net + timecode only")
     a = ap.parse_args()
+    if a.fps is None:
+        a.fps = str(TIMECODE_FPS)
+    if a.flag is None and TIMECODE_FLAG:
+        a.flag = str(TIMECODE_FLAG)
+    for name, value in (("TIMECODE_FPS / --fps", a.fps), ("TIMECODE_FLAG / --flag", a.flag)):
+        if value is not None and value not in RATES:
+            raise SystemExit(f"{name} must be one of {', '.join(sorted(RATES))} (got {value!r})")
     TC_FPS, TC_NOMINAL, TC_RATE_CODE = RATES[a.fps]
     TC_DROP = a.fps == "df"
     if a.flag:
@@ -217,9 +266,9 @@ def main():
     last_reply = 0.0
     sc_last = {"optin": 0.0, "keepalive": 0.0, "beat": 0.0, "osc": 0.0, "time": 0.0}
     sc_beat, sc_cue = 0, 0
-    bpm = 128.0
+    bpm = float(DJ_BPM)
     beat_period = 60.0 / bpm
-    h, m, sec, f = TC_START
+    h, m, sec, f = TIMECODE_START
     tc_frame = ((h * 60 + m) * 60 + sec) * TC_NOMINAL + f
     tc_next = time.time()
     qf_index = 0
