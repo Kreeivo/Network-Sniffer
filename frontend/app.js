@@ -359,6 +359,74 @@ function renderTimecode(snap) {
     : `<span class="hint">none heard yet</span>`;
 }
 
+/* ---------------- show control panel ---------------- */
+
+function fmtDst(f) {
+  const kind = f.dst_kind;
+  if (kind === "broadcast") return `<span class="mono">everyone</span><span class="dst-kind">broadcast${f.dst_ip ? " " + esc(f.dst_ip) : ""}</span>`;
+  if (kind === "multicast") return `<span class="mono">${esc(f.dst_ip)}</span><span class="dst-kind">multicast group</span>`;
+  if (kind === "this PC") return `<span class="mono">this computer</span><span class="dst-kind">${esc(f.dst_ip)}</span>`;
+  if (kind === "unicast") return `${esc(f.dst_name || f.dst_ip)}<span class="dst-kind">${f.dst_name ? esc(f.dst_ip) : "unicast"}</span>`;
+  return `<span class="mono">this computer / broadcast</span><span class="dst-kind">not reported by the OS</span>`;
+}
+
+function renderControl(snap) {
+  const nodes = snap.control_nodes || [];
+  const flows = snap.flows || [];
+  const box = $("control-nodes");
+  if (!nodes.length) {
+    box.innerHTML = `<div class="empty">Nothing announced yet. ShowKontrol / TCNet nodes and Pro DJ Link players appear here as soon as they speak.</div>`;
+  } else {
+    box.innerHTML = nodes.map((n) => {
+      const role = n.protocol === "TCNet" ? `TCNet ${esc(n.role)}` :
+                   `Pro DJ Link ${esc(n.role)}${n.device_number ? " #" + n.device_number : ""}`;
+      const beat = n.beating
+        ? `<span class="bpm">${n.bpm.toFixed(1)} BPM</span> <span class="mono">${n.pitch >= 0 ? "+" : ""}${n.pitch.toFixed(2)}%</span>
+           <span class="beat-dots">${[1, 2, 3, 4].map((b) => `<i class="${b === n.beat ? "on" : ""}"></i>`).join("")}</span>` : "";
+      const layers = (n.layers || []).filter((l) => l.state !== "idle" && l.state !== "stopped");
+      const layerHtml = n.protocol === "TCNet" && n.layers && n.layers.length
+        ? `<div class="layers">${(layers.length ? layers : []).map((l) =>
+            `<div class="layer ${esc(l.state)}"><span class="lname">L${l.layer}</span><span class="mono ltime">${fmtMs(l.ms)}</span><span class="lstate">${esc(l.state)}${l.beat ? " · beat " + l.beat : ""}</span></div>`).join("")
+           || `<div class="layer"><span class="lstate">all 8 layers idle</span></div>`}</div>` : "";
+      return `
+      <div class="cnode ${n.online ? "" : "offline"}">
+        <div class="cnode-top"><span class="cnode-name">${esc(n.name || n.ip)}</span><span class="cnode-role">${role}</span></div>
+        <div class="cnode-meta">
+          <span class="mono"><b>${esc(n.ip)}</b></span>
+          ${n.mac ? `<span class="mono">${esc(n.mac)}</span>` : ""}
+          ${n.app ? `<span>${esc(n.app)}</span>` : ""}
+          ${n.smpte ? `<span>timecode ${esc(n.smpte)}</span>` : ""}
+          ${beat ? `<span>${beat}</span>` : ""}
+        </div>
+        ${layerHtml}
+      </div>`;
+    }).join("");
+  }
+
+  const tbody = $("flow-table").querySelector("tbody");
+  if (!flows.length) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="8">No show-control packets seen yet.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = flows.map((f) => `
+    <tr>
+      <td>${esc(f.src_name || f.src_ip)}${f.src_name ? `<div class="dst-kind mono">${esc(f.src_ip)}</div>` : ""}</td>
+      <td class="arrow">→</td>
+      <td>${fmtDst(f)}<span class="dst-kind">:${f.port}</span></td>
+      <td>${esc(f.protocol)}</td>
+      <td class="mono">${esc(f.kind)}</td>
+      <td class="mono">${f.packets_per_sec.toFixed(1)} /s</td>
+      <td class="flow-content mono" title="${esc(f.last_summary)}">${esc(f.last_summary)}</td>
+      <td><span class="pill ${f.active ? "purple" : f.online ? "" : "off"}"></span></td>
+    </tr>`).join("");
+}
+
+function fmtMs(ms) {
+  const s = Math.floor(ms / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60);
+  const p2 = (x) => String(x).padStart(2, "0");
+  return `${p2(h)}:${p2(m % 60)}:${p2(s % 60)}.${String(ms % 1000).padStart(3, "0")}`;
+}
+
 /* ---------------- LAN table ---------------- */
 
 function renderLan(devs) {
@@ -394,7 +462,11 @@ function renderTopology(snap) {
   for (const s of snap.timecode || []) {
     if (!known.has(s.ip)) { known.add(s.ip); tcOnly.push(s); }
   }
-  const shownCount = Math.min(9, snap.devices.length + tcOnly.length + snap.lan_devices.length);
+  const ctrlOnly = [];
+  for (const n of snap.control_nodes || []) {
+    if (!known.has(n.ip)) { known.add(n.ip); ctrlOnly.push(n); }
+  }
+  const shownCount = Math.min(9, snap.devices.length + tcOnly.length + ctrlOnly.length + snap.lan_devices.length);
   const W = 900, H = Math.max(240, shownCount * 62 + 130);
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
 
@@ -407,6 +479,7 @@ function renderTopology(snap) {
       active: d.bytes_per_sec > 1,
       online: d.online,
       artnet: true,
+      ip: d.ip,
     })),
     ...tcOnly.map((s) => ({
       label: s.name || s.ip,
@@ -415,6 +488,16 @@ function renderTopology(snap) {
       online: s.online,
       artnet: false,
       timecode: true,
+      ip: s.ip,
+    })),
+    ...ctrlOnly.map((n) => ({
+      label: n.name || n.ip,
+      sub: `${n.ip} · ${n.protocol === "TCNet" ? "TCNet " + n.role : n.role + (n.device_number ? " #" + n.device_number : "")}`,
+      active: false,
+      online: n.online,
+      artnet: false,
+      control: true,
+      ip: n.ip,
     })),
     ...snap.lan_devices.map((d) => ({
       label: d.hostname || d.vendor || d.ip,
@@ -422,6 +505,7 @@ function renderTopology(snap) {
       active: false,
       online: d.online,
       artnet: false,
+      ip: d.ip,
     })),
   ];
   const MAX = 9;
@@ -437,14 +521,22 @@ function renderTopology(snap) {
   svg.appendChild(svgEl("text", { x: pcX, y: midY + 14, "text-anchor": "middle", class: "topo-sub" },
     (snap.local_ips && snap.local_ips[0]) || ""));
 
+  // Show-control flows: which IPs are sending right now, and to whom.
+  const flows = (snap.flows || []).filter((f) => f.active);
+  const ctrlSrc = new Set(flows.map((f) => f.src_ip));
+  const ctrlToPc = flows.some((f) => f.dst_kind === "this PC");
+  const ctrlToAll = flows.some((f) => f.dst_kind === "broadcast" || f.dst_kind === "multicast" || f.dst_kind === "unknown");
+  const unicastPairs = flows.filter((f) => f.dst_kind === "unicast").map((f) => [f.src_ip, f.dst_ip]);
+
   // Switch / LAN hub (implied — an unmanaged switch has no IP to detect)
-  svg.appendChild(svgEl("circle", { cx: hubX, cy: midY, r: 26, fill: "#22272d", stroke: "#2b3138", "stroke-width": 1.5 }));
+  svg.appendChild(svgEl("circle", { cx: hubX, cy: midY, r: 26, fill: "#22272d", stroke: "#2b3138", "stroke-width": 1.5,
+    class: "topo-hub" + (ctrlToAll ? " control" : "") }));
   svg.appendChild(svgEl("text", { x: hubX, y: midY - 34, "text-anchor": "middle", class: "topo-sub" }, "switch / LAN"));
 
   const anyFlow = snap.global_bps > 5;
   svg.appendChild(svgEl("path", {
     d: `M ${pcX + 75} ${midY} H ${hubX - 26}`,
-    class: "topo-link" + (anyFlow ? " flowing" : ""),
+    class: "topo-link" + (ctrlToPc || ctrlToAll ? " control" : anyFlow ? " flowing" : ""),
   }));
 
   if (!shown.length) {
@@ -459,16 +551,30 @@ function renderTopology(snap) {
   shown.forEach((n, i) => {
     const y = startY + i * gap;
     const c1x = hubX + 120;
+    const sending = ctrlSrc.has(n.ip);
     svg.appendChild(svgEl("path", {
       d: `M ${hubX + 26} ${midY} C ${c1x} ${midY}, ${c1x} ${y}, ${devX - 78} ${y}`,
-      class: "topo-link" + (n.active ? " flowing" : ""),
+      class: "topo-link" + (sending ? " control" : n.active ? " flowing" : ""),
     }));
-    const stroke = !n.online ? "#f26d6d" : (n.artnet ? "#ffb020" : n.timecode ? "#b58cff" : "#2b3138");
-    svg.appendChild(svgEl("rect", { x: devX - 78, y: y - 22, width: 200, height: 44, rx: 5, fill: "#22272d", stroke, "stroke-width": (n.artnet || n.timecode) ? 1.6 : 1 }));
+    const stroke = !n.online ? "#f26d6d" : sending ? "#d24bff" : (n.artnet ? "#ffb020" : n.timecode ? "#b58cff" : n.control ? "#d24bff" : "#2b3138");
+    svg.appendChild(svgEl("rect", { x: devX - 78, y: y - 22, width: 200, height: 44, rx: 5, fill: "#22272d", stroke, "stroke-width": (n.artnet || n.timecode || n.control || sending) ? 1.6 : 1 }));
+    n.y = y;
     const label = n.label.length > 22 ? n.label.slice(0, 21) + "…" : n.label;
     svg.appendChild(svgEl("text", { x: devX - 66, y: y - 2, class: "topo-label" }, label));
     svg.appendChild(svgEl("text", { x: devX - 66, y: y + 15, class: "topo-sub" }, n.sub));
   });
+
+  // Unicast show control between two devices on the map: a direct purple
+  // line looping out to the right of the device column.
+  const yOf = new Map(shown.map((n) => [n.ip, n.y]));
+  for (const [src, dst] of unicastPairs) {
+    if (!yOf.has(src) || !yOf.has(dst) || src === dst) continue;
+    const y1 = yOf.get(src), y2 = yOf.get(dst), bx = devX + 122, cx = bx + 60;
+    svg.appendChild(svgEl("path", {
+      d: `M ${bx} ${y1} C ${cx} ${y1}, ${cx} ${y2}, ${bx} ${y2}`,
+      class: "topo-link control",
+    }));
+  }
 
   if (extra > 0) {
     svg.appendChild(svgEl("text", { x: devX + 20, y: startY + shown.length * gap, class: "topo-sub" },
@@ -510,6 +616,7 @@ function connect() {
     renderDevices(snap.devices);
     renderUniverses(snap.universes);
     renderTimecode(snap);
+    renderControl(snap);
     renderLan(snap.lan_devices);
     renderTopology(snap);
   };
