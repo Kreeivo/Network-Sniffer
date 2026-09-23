@@ -533,6 +533,163 @@ def mdns_midi_sessions(data: bytes) -> List[Tuple[str, int]]:
 
 
 # --------------------------------------------------------------------------- #
+#  Show control on the wire - listen-only
+# --------------------------------------------------------------------------- #
+#  What a ShowKontrol rig puts on the network, and what a third machine on
+#  a normal switch can see of it:
+#
+#    * TCNet (TC Supply's open protocol, ShowKontrol's own output) - every
+#      node broadcasts an OptIn on UDP 60000 with its name, vendor/app and
+#      master/slave role; the master broadcasts Time on UDP 60001 with the
+#      running time and state of each of its layers. Broadcast: visible.
+#    * Pro DJ Link (ShowKontrol's input from the CDJs/DJM) - keep-alives on
+#      UDP 50000 with device names, numbers, MAC and IP; beats on 50001 with
+#      BPM, pitch and beat-in-bar. Broadcast: visible.
+#    * OSC on the usual show-control ports - visible when broadcast or sent
+#      to this machine; unicast between two other boxes is not.
+#
+#  Every packet is also recorded as a flow from its source to its real
+#  destination address (read from the packet where the OS allows), which is
+#  what the map draws as the purple connection lines.
+
+TCNET_PORTS = (60000, 60001)          # management (OptIn/Status) / Time
+TCNET_MAGIC = b"TCN"
+TCNET_MSG = {2: "OptIn", 3: "OptOut", 5: "Status", 10: "TimeSync", 13: "Error",
+             20: "Request", 30: "ApplicationData", 101: "Control", 128: "Text",
+             132: "Keyboard", 200: "Data", 204: "File", 254: "Time"}
+TCNET_NODE_TYPE = {1: "Auto", 2: "Master", 4: "Slave", 8: "Repeater"}
+TCNET_LAYER_STATE = {0: "idle", 1: "playing", 2: "looping", 3: "paused",
+                     4: "stopped", 5: "cueing", 6: "cued"}
+TCNET_SMPTE = {0: "24 fps", 1: "25 fps", 2: "29.97 fps drop", 3: "30 fps"}
+
+PDJL_PORTS = (50000, 50001)           # keep-alive / beat
+PDJL_MAGIC = bytes.fromhex("5173707431576d4a4f4c")     # "Qspt1WmJOL"
+PDJL_DEVICE_TYPE = {1: "CDJ", 2: "Mixer"}
+
+OSC_PORTS_DEFAULT = (8000, 9000, 7000, 7001, 53000)   # MA/consoles, Resolume, QLab
+
+
+def parse_tcnet(data: bytes) -> Optional[dict]:
+    """TCNet header (24 bytes) plus what we understand of OptIn/Status/Time."""
+    if len(data) < 24 or data[4:7] != TCNET_MAGIC:
+        return None
+    msg_type = data[7]
+    out = {
+        "node_id": struct.unpack_from("<H", data, 0)[0],
+        "version": f"{data[2]}.{data[3]}",
+        "msg": TCNET_MSG.get(msg_type, f"type {msg_type}"),
+        "node_name": _cstr(data[8:16]),
+        "node_type": TCNET_NODE_TYPE.get(data[17], f"type {data[17]}"),
+    }
+    if msg_type == 2 and len(data) >= 67:                  # OptIn
+        out["node_count"] = struct.unpack_from("<H", data, 24)[0]
+        out["listener_port"] = struct.unpack_from("<H", data, 26)[0]
+        out["vendor"] = _cstr(data[32:48])
+        out["app"] = _cstr(data[48:64])
+        out["app_version"] = f"{data[64]}.{data[65]}.{data[66]}"
+    elif msg_type == 254 and len(data) >= 106:             # Time
+        layers = []
+        for i in range(8):
+            ms = struct.unpack_from("<I", data, 24 + i * 4)[0]
+            total = struct.unpack_from("<I", data, 56 + i * 4)[0]
+            state = data[96 + i]
+            layers.append({"layer": i + 1, "ms": ms, "total_ms": total,
+                           "beat": data[88 + i],
+                           "state": TCNET_LAYER_STATE.get(state, f"state {state}")})
+        out["layers"] = layers
+        out["smpte"] = TCNET_SMPTE.get(data[105], f"mode {data[105]}")
+    elif msg_type == 5 and len(data) >= 300:               # Status
+        out["smpte"] = TCNET_SMPTE.get(data[83], f"mode {data[83]}")
+        out["layer_names"] = [_cstr(data[172 + i * 16:188 + i * 16]) for i in range(8)]
+        out["layer_sources"] = list(data[34:42])
+    return out
+
+
+def fmt_ms(ms: int) -> str:
+    s, ms = divmod(int(ms), 1000)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def parse_pdjl(data: bytes, port: int) -> Optional[dict]:
+    """Pro DJ Link keep-alive (port 50000, type 0x06) and beat (50001, 0x28)."""
+    if len(data) < 0x24 or data[:10] != PDJL_MAGIC:
+        return None
+    ptype = data[0x0A]
+    out = {"type": ptype, "name": _cstr(data[0x0B:0x1F])}
+    if port == 50000 and ptype == 0x06 and len(data) >= 0x36:
+        out.update({
+            "msg": "keep-alive",
+            "device_number": data[0x22],
+            "mac": _mac(data[0x23:0x29]),
+            "ip": ".".join(str(b) for b in data[0x29:0x2D]),
+            "device_type": PDJL_DEVICE_TYPE.get(data[0x34], "Computer"),
+        })
+    elif port == 50001 and ptype == 0x28 and len(data) >= 0x60:
+        pitch_raw = struct.unpack_from(">I", data, 0x54)[0] & 0xFFFFFF
+        bpm = struct.unpack_from(">H", data, 0x5A)[0] / 100.0
+        out.update({
+            "msg": "beat",
+            "device_number": data[0x21],
+            "bpm": bpm,
+            "pitch": (pitch_raw - 0x100000) / 0x100000 * 100.0,
+            "effective_bpm": bpm * pitch_raw / 0x100000,
+            "beat": data[0x5C],
+        })
+    else:
+        out["msg"] = {0x0A: "hello", 0x00: "announce", 0x02: "number-assign",
+                      0x04: "number-assign", 0x2A: "on-air", 0x03: "sync-control",
+                      0x26: "fader-start"}.get(ptype, f"type 0x{ptype:02X}")
+    return out
+
+
+def _osc_str(data: bytes, i: int) -> Tuple[str, int]:
+    end = data.find(b"\x00", i)
+    if end < 0:
+        return "", len(data)
+    s = data[i:end].decode("utf-8", errors="replace")
+    return s, (end + 4) & ~3                          # pad to 4 bytes
+
+
+def parse_osc(data: bytes, depth: int = 0) -> List[str]:
+    """Flatten an OSC packet (message or bundle) into readable lines."""
+    if data[:8] == b"#bundle\x00":
+        out, i = [], 16
+        while i + 4 <= len(data) and depth < 4:
+            size = struct.unpack_from(">I", data, i)[0]
+            i += 4
+            out += parse_osc(data[i:i + size], depth + 1)
+            i += size
+        return out[:8]
+    if not data.startswith(b"/"):
+        return []
+    addr, i = _osc_str(data, 0)
+    if i >= len(data) or data[i:i + 1] != b",":
+        return [addr]
+    tags, i = _osc_str(data, i)
+    args: List[str] = []
+    for tag in tags[1:]:
+        if tag == "i" and i + 4 <= len(data):
+            args.append(str(struct.unpack_from(">i", data, i)[0])); i += 4
+        elif tag == "f" and i + 4 <= len(data):
+            args.append(f"{struct.unpack_from('>f', data, i)[0]:g}"); i += 4
+        elif tag == "s":
+            s, i = _osc_str(data, i); args.append(f'"{s}"')
+        elif tag in "TFNI":
+            args.append({"T": "true", "F": "false", "N": "nil", "I": "inf"}[tag])
+        elif tag == "h" and i + 8 <= len(data):
+            args.append(str(struct.unpack_from(">q", data, i)[0])); i += 8
+        elif tag == "d" and i + 8 <= len(data):
+            args.append(f"{struct.unpack_from('>d', data, i)[0]:g}"); i += 8
+        elif tag == "b" and i + 4 <= len(data):
+            n = struct.unpack_from(">I", data, i)[0]; args.append(f"<{n} bytes>")
+            i += 4 + ((n + 3) & ~3)
+        else:
+            break
+    return [addr + (" " + " ".join(args) if args else "")]
+
+# --------------------------------------------------------------------------- #
 #  Rolling-rate helpers
 # --------------------------------------------------------------------------- #
 
@@ -698,6 +855,56 @@ class MidiEndpoint:
         return d
 
 
+@dataclass
+class ControlNode:
+    """A show-control participant that announced itself (TCNet OptIn or a
+    Pro DJ Link keep-alive)."""
+    ip: str
+    protocol: str                     # TCNet / Pro DJ Link
+    name: str = ""
+    role: str = ""                    # TCNet Master/Slave...; CDJ / Mixer / Computer
+    app: str = ""                     # vendor · app · version (TCNet)
+    device_number: int = 0            # Pro DJ Link player number
+    mac: str = ""
+    bpm: float = 0.0                  # Pro DJ Link beat data
+    pitch: float = 0.0
+    beat: int = 0
+    layers: list = field(default_factory=list)   # TCNet master's layers
+    smpte: str = ""
+    first_seen: float = field(default_factory=now)
+    last_seen: float = field(default_factory=now)
+    last_beat: float = 0.0
+
+    def to_dict(self):
+        d = asdict(self)
+        t = now()
+        d["online"] = (t - self.last_seen) < 8.0
+        d["beating"] = (t - self.last_beat) < 2.5
+        return d
+
+
+@dataclass
+class Flow:
+    """One stream of show-control packets from a source to a destination."""
+    src_ip: str
+    dst_ip: str                       # "" when the OS can't tell us
+    port: int
+    protocol: str
+    kind: str = ""                    # message type / OSC address
+    packets: int = 0
+    bytes: int = 0
+    packets_per_sec: float = 0.0
+    last_summary: str = ""
+    first_seen: float = field(default_factory=now)
+    last_seen: float = field(default_factory=now)
+
+    def to_dict(self):
+        d = asdict(self)
+        d["active"] = (now() - self.last_seen) < 3.0
+        d["online"] = (now() - self.last_seen) < 30.0
+        return d
+
+
 class Engine:
     def __init__(self):
         self.devices: Dict[str, Device] = {}
@@ -712,6 +919,10 @@ class Engine:
         self.tc_rate: Dict[str, Rate] = {}
         self.midi_decoders: Dict[str, MidiTimecodeDecoder] = {}
         self.midi_endpoints: Dict[str, MidiEndpoint] = {}
+        self.control_nodes: Dict[str, ControlNode] = {}
+        self.flows: Dict[str, Flow] = {}
+        self.flow_rate: Dict[str, Rate] = {}
+        self.local_broadcasts: List[str] = []
         self.listeners: List[str] = []
         # Which master the dashboard should headline when several are on
         # the wire. A preference, not a lock: the UI falls back to another
@@ -726,7 +937,7 @@ class Engine:
         self.started = now()
         self.local_ips: List[str] = []
 
-    def on_packet(self, data: bytes, src_ip: str):
+    def on_packet(self, data: bytes, src_ip: str, dst_ip: str = ""):
         op = identify(data)
         if op is None:
             return
@@ -755,6 +966,8 @@ class Engine:
             tc = parse_art_timecode(data)
             if tc:
                 self.on_timecode(src_ip, "Art-Net timecode", ARTNET_PORT, tc)
+                self.note_flow(src_ip, dst_ip, ARTNET_PORT, "Art-Net timecode",
+                               "ArtTimeCode", fmt_timecode(tc["tc"]), len(data))
 
     def _apply_reply(self, info: dict):
         dev = self.devices.setdefault(info["ip"], Device(ip=info["ip"]))
@@ -820,8 +1033,12 @@ class Engine:
         """Raw MIDI bytes off the wire (ipMIDI, or an unwrapped RTP-MIDI list)."""
         key = f"{transport}|{ip}"
         decoder = self.midi_decoders.setdefault(key, MidiTimecodeDecoder())
+        summary = ""
         for reading in decoder.feed(data):
             self.on_timecode(ip, transport, port, reading)
+            summary = f"{reading['kind']} {fmt_timecode(reading['tc'])}"
+        self.note_flow(ip, IPMIDI_GROUP if transport.startswith("ipMIDI") else "",
+                       port, transport, "MIDI", summary or f"{len(data)} MIDI bytes", len(data))
 
     def note_midi_endpoint(self, ip: str, name: str, port: int, source: str):
         ep = self.midi_endpoints.setdefault(ip, MidiEndpoint(ip=ip))
@@ -843,6 +1060,95 @@ class Engine:
         if lan and lan.hostname:
             return lan.hostname
         return ""
+
+    # -- show control -------------------------------------------------------
+
+    def dst_kind(self, dst_ip: str) -> str:
+        if not dst_ip:
+            return "unknown"
+        if dst_ip == "255.255.255.255" or dst_ip in self.local_broadcasts:
+            return "broadcast"
+        first = int(dst_ip.split(".")[0]) if dst_ip[:1].isdigit() else 0
+        if 224 <= first <= 239:
+            return "multicast"
+        if dst_ip in self.local_ips or dst_ip.startswith("127."):
+            return "this PC"
+        return "unicast"
+
+    def note_flow(self, src_ip: str, dst_ip: str, port: int, protocol: str,
+                  kind: str, summary: str, size: int):
+        key = f"{protocol}|{src_ip}|{dst_ip}|{port}"
+        f = self.flows.setdefault(
+            key, Flow(src_ip=src_ip, dst_ip=dst_ip, port=port, protocol=protocol))
+        f.kind = kind or f.kind
+        f.packets += 1
+        f.bytes += size
+        f.last_summary = summary or f.last_summary
+        f.last_seen = now()
+        r = self.flow_rate.setdefault(key, Rate())
+        r.add(size)
+        f.packets_per_sec = r.pps()
+
+    def on_tcnet(self, data: bytes, src_ip: str, dst_ip: str, port: int):
+        pkt = parse_tcnet(data)
+        if not pkt:
+            return
+        node = self.control_nodes.setdefault(
+            f"TCNet|{src_ip}|{pkt['node_id']}", ControlNode(ip=src_ip, protocol="TCNet"))
+        node.name = pkt["node_name"] or node.name
+        node.role = pkt["node_type"]
+        node.last_seen = now()
+        summary = pkt["msg"]
+        if pkt["msg"] == "OptIn":
+            node.app = " ".join(x for x in (pkt.get("vendor"), pkt.get("app"),
+                                            pkt.get("app_version")) if x)
+            summary = f"OptIn {node.app} · {pkt.get('node_count', 0)} nodes"
+        elif pkt["msg"] == "Time":
+            node.layers = pkt["layers"]
+            node.smpte = pkt["smpte"]
+            live = [l for l in pkt["layers"] if l["state"] not in ("idle", "stopped")]
+            summary = ("Time " + ", ".join(f"L{l['layer']} {fmt_ms(l['ms'])} {l['state']}"
+                                           for l in live[:3])) if live else "Time (all layers idle)"
+        elif pkt["msg"] == "Status":
+            names = [n for n in pkt.get("layer_names", []) if n]
+            node.smpte = pkt.get("smpte") or node.smpte
+            summary = "Status " + (", ".join(names[:4]) if names else "")
+        self.note_flow(src_ip, dst_ip, port, "TCNet", pkt["msg"], summary, len(data))
+
+    def on_pdjl(self, data: bytes, src_ip: str, dst_ip: str, port: int):
+        pkt = parse_pdjl(data, port)
+        if not pkt:
+            return
+        node = self.control_nodes.setdefault(
+            f"Pro DJ Link|{src_ip}|{pkt.get('device_number', 0)}",
+            ControlNode(ip=src_ip, protocol="Pro DJ Link"))
+        node.name = pkt["name"] or node.name
+        node.last_seen = now()
+        summary = pkt["msg"]
+        if pkt["msg"] == "keep-alive":
+            node.role = pkt["device_type"]
+            node.device_number = pkt["device_number"]
+            node.mac = pkt["mac"] or node.mac
+            summary = f"keep-alive #{pkt['device_number']} {pkt['device_type']}"
+        elif pkt["msg"] == "beat":
+            node.device_number = pkt["device_number"] or node.device_number
+            node.bpm, node.pitch, node.beat = pkt["effective_bpm"], pkt["pitch"], pkt["beat"]
+            node.last_beat = now()
+            summary = f"beat {pkt['beat']}/4 · {pkt['effective_bpm']:.1f} BPM ({pkt['pitch']:+.2f}%)"
+        self.note_flow(src_ip, dst_ip, port, "Pro DJ Link", pkt["msg"], summary, len(data))
+
+    def on_osc(self, data: bytes, src_ip: str, dst_ip: str, port: int):
+        lines = parse_osc(data)
+        if not lines:
+            return
+        self.note_flow(src_ip, dst_ip, port, "OSC", lines[0].split(" ")[0],
+                       " · ".join(lines[:3]), len(data))
+
+    def control_name_for_ip(self, ip: str) -> str:
+        names = sorted({n.name for n in self.control_nodes.values() if n.ip == ip and n.name})
+        if names:
+            return names[0] if len(names) == 1 else names[0] + f" +{len(names) - 1}"
+        return self.name_for_ip(ip)
 
     def merge_lan(self, entries: List[dict]):
         for e in entries:
@@ -870,6 +1176,11 @@ class Engine:
         for ip in [i for i, e in self.midi_endpoints.items()
                    if t - e.last_seen > 900]:
             self.midi_endpoints.pop(ip)
+        for k in [k for k, n in self.control_nodes.items() if t - n.last_seen > 600]:
+            self.control_nodes.pop(k)
+        for k in [k for k, f in self.flows.items() if t - f.last_seen > 120]:
+            self.flows.pop(k)
+            self.flow_rate.pop(k, None)
 
     # -- which master the dashboard headlines ------------------------------
 
@@ -952,7 +1263,30 @@ class Engine:
             "tc_hold": self.tc_hold,
             "tc_lead": self.tc_lead,
             "tc_lead_reason": self.tc_lead_reason,
+            "control_nodes": [self._node_dict(n) for n in
+                              sorted(self.control_nodes.values(),
+                                     key=lambda n: (n.protocol, n.device_number, ip_key(n.ip)))],
+            "flows": [self._flow_dict(f) for f in
+                      sorted(self.flows.values(),
+                             key=lambda f: (f.protocol, ip_key(f.src_ip), f.dst_ip, f.port))],
         }
+
+    def _node_dict(self, n: ControlNode) -> dict:
+        d = n.to_dict()
+        d["key"] = f"{n.protocol}|{n.ip}|{n.device_number}|{n.name}"
+        d["name"] = n.name or self.name_for_ip(n.ip)
+        return d
+
+    def _flow_dict(self, f: Flow) -> dict:
+        d = f.to_dict()
+        d["key"] = f"{f.protocol}|{f.src_ip}|{f.dst_ip}|{f.port}"
+        d["src_name"] = self.control_name_for_ip(f.src_ip)
+        d["dst_kind"] = self.dst_kind(f.dst_ip)
+        d["dst_name"] = (self.control_name_for_ip(f.dst_ip)
+                         if d["dst_kind"] == "unicast" else "")
+        r = self.flow_rate.get(d["key"])
+        d["packets_per_sec"] = r.pps() if r else 0.0
+        return d
 
     def _tc_dict(self, src: TimecodeSource) -> dict:
         # Names can arrive after the timecode does (an ArtPollReply or an
@@ -971,21 +1305,10 @@ class Engine:
 #  UDP listener
 # --------------------------------------------------------------------------- #
 
-class ArtNetProtocol(asyncio.DatagramProtocol):
-    def __init__(self, engine: Engine):
-        self.engine = engine
-
-    def datagram_received(self, data, addr):
-        # Ignore our own outgoing ArtPoll echoing back off the broadcast.
-        if addr[0] in self.engine.local_ips and identify(data) == OP_POLL:
-            return
-        self.engine.on_packet(data, addr[0])
-
-    def error_received(self, exc):
-        pass
-
-
-async def open_artnet_socket(engine: Engine) -> asyncio.DatagramTransport:
+async def open_artnet_socket(engine: Engine):
+    """-> (socket, closer). Received through the destination-aware reader so
+    Art-Net timecode flows show where they were sent; ArtPoll goes out
+    through the same socket."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     if hasattr(socket, "SO_REUSEPORT"):
@@ -996,10 +1319,15 @@ async def open_artnet_socket(engine: Engine) -> asyncio.DatagramTransport:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.bind(("0.0.0.0", ARTNET_PORT))
     sock.setblocking(False)
-    loop = asyncio.get_running_loop()
-    transport, _ = await loop.create_datagram_endpoint(
-        lambda: ArtNetProtocol(engine), sock=sock)
-    return transport
+
+    def handler(data, src_ip, dst_ip, _port):
+        # Ignore our own outgoing ArtPoll echoing back off the broadcast.
+        if src_ip in engine.local_ips and identify(data) == OP_POLL:
+            return
+        engine.on_packet(data, src_ip, dst_ip)
+
+    closer = await open_dst_listener(sock, ARTNET_PORT, handler)
+    return sock, closer
 
 # --------------------------------------------------------------------------- #
 #  MTC listeners (multicast joins + optional RTP-MIDI ports)
@@ -1123,6 +1451,99 @@ async def open_mtc_listeners(engine: Engine) -> List[asyncio.DatagramTransport]:
         if opened:
             engine.listeners.append("RTP-MIDI (UDP " + "/".join(opened) + ")")
     return transports
+
+# --------------------------------------------------------------------------- #
+#  Show-control listeners - these also read each packet's destination
+# --------------------------------------------------------------------------- #
+
+class _DstProtocol(asyncio.DatagramProtocol):
+    """Fallback (Windows / proactor loops): no destination address."""
+    def __init__(self, handler, port):
+        self.handler, self.port = handler, port
+
+    def datagram_received(self, data, addr):
+        self.handler(data, addr[0], "", self.port)
+
+    def error_received(self, exc):
+        pass
+
+
+async def open_dst_listener(sock: socket.socket, port: int, handler):
+    """Deliver (data, src_ip, dst_ip, port). On Linux/macOS the destination
+    comes from IP_PKTINFO / IP_RECVDSTADDR ancillary data, which is how a
+    broadcast can be told from a packet aimed at this machine. Where that
+    isn't possible the destination is reported as "" (unknown)."""
+    loop = asyncio.get_running_loop()
+    # Python's socket module doesn't export these on every platform, so the
+    # kernel values are spelled out: Linux IP_PKTINFO=8 (in_pktinfo: ifindex,
+    # spec_dst, addr); macOS/BSD IP_RECVDSTADDR=7 (in_addr). Windows has no
+    # recvmsg in Python, so it takes the fallback below.
+    system = platform.system().lower()
+    opt, is_pktinfo = None, False
+    if system == "linux":
+        opt, is_pktinfo = getattr(socket, "IP_PKTINFO", 8), True
+    elif system in ("darwin", "freebsd", "openbsd", "netbsd"):
+        opt = getattr(socket, "IP_RECVDSTADDR", 7)
+    if opt is not None:
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, opt, 1)
+        except OSError:
+            opt = None
+
+    def readable():
+        for _ in range(64):                      # drain a burst per wake-up
+            try:
+                data, anc, _flags, addr = sock.recvmsg(65535, 256)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                return
+            dst = ""
+            for level, typ, cdata in anc:
+                if level == socket.IPPROTO_IP and typ == opt:
+                    raw = cdata[8:12] if is_pktinfo and len(cdata) >= 12 else cdata[:4]
+                    if len(raw) == 4:
+                        dst = socket.inet_ntoa(raw)
+            handler(data, addr[0], dst, port)
+
+    if opt is not None and hasattr(sock, "recvmsg"):
+        try:
+            loop.add_reader(sock.fileno(), readable)
+            return lambda: (loop.remove_reader(sock.fileno()), sock.close())
+        except NotImplementedError:
+            pass                                  # proactor loop: fall through
+    transport, _ = await loop.create_datagram_endpoint(
+        lambda: _DstProtocol(handler, port), sock=sock)
+    return transport.close
+
+
+async def open_control_listeners(engine: Engine) -> List:
+    closers = []
+
+    async def listen(port, handler, label, share=True):
+        try:
+            sock = _udp_socket(port, share=share)
+            closers.append(await open_dst_listener(sock, port, handler))
+            return True
+        except OSError as e:
+            print(f"  {label} port {port}: not listening ({e})")
+            return False
+
+    if ARGS.tcnet:
+        ok = [p for p in TCNET_PORTS if await listen(p, engine.on_tcnet, "TCNet")]
+        if ok:
+            engine.listeners.append("TCNet (UDP " + "/".join(map(str, ok)) + ")")
+    if ARGS.pdjl:
+        ok = [p for p in PDJL_PORTS if await listen(p, engine.on_pdjl, "Pro DJ Link")]
+        if ok:
+            engine.listeners.append("Pro DJ Link (UDP " + "/".join(map(str, ok)) + ")")
+    if ARGS.osc_ports:
+        # Unicast ports: never shared, so we can't split packets with a
+        # console or media server running on this machine.
+        ok = [p for p in ARGS.osc_ports if await listen(p, engine.on_osc, "OSC", share=False)]
+        if ok:
+            engine.listeners.append("OSC (UDP " + "/".join(map(str, ok)) + ")")
+    return closers
 
 # --------------------------------------------------------------------------- #
 #  LAN discovery (best-effort, no admin rights needed)
@@ -1250,7 +1671,8 @@ engine = Engine()
 transport_ref: dict = {}
 ARGS = argparse.Namespace(lan_scan=True, poll_interval=5.0,
                           mtc=True, ipmidi_buses=4, mdns=True, rtp_midi=False,
-                          preferred_tc_ip="", tc_hold=5.0)
+                          preferred_tc_ip="", tc_hold=5.0,
+                          tcnet=True, pdjl=True, osc_ports=list(OSC_PORTS_DEFAULT))
 
 TC_HOLD_MIN, TC_HOLD_MAX = 1.0, 120.0
 
@@ -1265,14 +1687,14 @@ def valid_ipv4(text: str) -> bool:
 async def task_artpoll():
     pkt = build_artpoll()
     while True:
-        t = transport_ref.get("t")
-        if t:
+        sock = transport_ref.get("sock")
+        if sock:
             try:
-                t.sendto(pkt, ("255.255.255.255", ARTNET_PORT))
+                sock.sendto(pkt, ("255.255.255.255", ARTNET_PORT))
                 # Also hit each subnet's directed broadcast - some nodes
                 # only answer those.
                 for _, net in list_local_networks():
-                    t.sendto(pkt, (str(net.broadcast_address), ARTNET_PORT))
+                    sock.sendto(pkt, (str(net.broadcast_address), ARTNET_PORT))
             except OSError:
                 pass
         await asyncio.sleep(ARGS.poll_interval)
@@ -1299,8 +1721,10 @@ async def lifespan(app: FastAPI):
     engine.local_ips = [ip for ip, _ in list_local_networks()]
     engine.preferred_tc_ip = ARGS.preferred_tc_ip
     engine.tc_hold = ARGS.tc_hold
-    transport_ref["t"] = await open_artnet_socket(engine)
+    engine.local_broadcasts = [str(n.broadcast_address) for _, n in list_local_networks()]
+    transport_ref["sock"], transport_ref["close"] = await open_artnet_socket(engine)
     extra_transports = await open_mtc_listeners(engine) if ARGS.mtc else []
+    control_closers = await open_control_listeners(engine)
     tasks = [asyncio.create_task(task_artpoll()),
              asyncio.create_task(task_prune())]
     if ARGS.lan_scan:
@@ -1308,11 +1732,13 @@ async def lifespan(app: FastAPI):
     yield
     for t in tasks:
         t.cancel()
-    tr = transport_ref.get("t")
-    if tr:
-        tr.close()
+    close_artnet = transport_ref.get("close")
+    if close_artnet:
+        close_artnet()
     for t in extra_transports:
         t.close()
+    for close in control_closers:
+        close()
 
 
 app = FastAPI(title="DMX/Art-Net Network Inspector", lifespan=lifespan)
@@ -1390,6 +1816,14 @@ def main():
                     help="how long the headline stays on a timecode master "
                          "after its signal stops before another may take over "
                          "(default 5, range 1-120); can also be set in the UI")
+    ap.add_argument("--no-tcnet", action="store_true",
+                    help="don't listen for TCNet (ShowKontrol) on UDP 60000/60001")
+    ap.add_argument("--no-pro-dj-link", action="store_true",
+                    help="don't listen for Pioneer Pro DJ Link on UDP 50000/50001")
+    ap.add_argument("--osc-ports", default=",".join(map(str, OSC_PORTS_DEFAULT)),
+                    metavar="PORTS",
+                    help="comma-separated UDP ports to watch for OSC (default "
+                         + ",".join(map(str, OSC_PORTS_DEFAULT)) + "; 'none' to disable)")
     ap.add_argument("--rtp-midi", action="store_true",
                     help="also listen on the RTP-MIDI/AppleMIDI ports 5004/5005 "
                          "(only useful when this machine is a session endpoint "
@@ -1407,6 +1841,15 @@ def main():
     if not (TC_HOLD_MIN <= a.mtc_hold <= TC_HOLD_MAX):
         ap.error(f"--mtc-hold must be between {TC_HOLD_MIN:g} and {TC_HOLD_MAX:g} seconds")
     ARGS.tc_hold = a.mtc_hold
+    ARGS.tcnet = not a.no_tcnet
+    ARGS.pdjl = not a.no_pro_dj_link
+    try:
+        ARGS.osc_ports = ([] if a.osc_ports.strip().lower() in ("", "none") else
+                          sorted({int(p) for p in a.osc_ports.split(",") if p.strip()}))
+        if any(not 1 <= p <= 65535 for p in ARGS.osc_ports):
+            raise ValueError
+    except ValueError:
+        ap.error("--osc-ports must be comma-separated port numbers, or 'none'")
 
     local = engine.local_ips or [ip for ip, _ in list_local_networks()]
     print("=" * 62)
@@ -1424,6 +1867,11 @@ def main():
         if ARGS.rtp_midi:
             tc_bits.append("RTP-MIDI 5004/5005")
         print(f"  Timecode:   {', '.join(tc_bits)}, passive")
+    sc_bits = (["TCNet 60000/60001"] if ARGS.tcnet else []) + \
+              (["Pro DJ Link 50000/50001"] if ARGS.pdjl else []) + \
+              ([f"OSC {','.join(map(str, ARGS.osc_ports))}"] if ARGS.osc_ports else [])
+    if sc_bits:
+        print(f"  Show ctrl:  {', '.join(sc_bits)}, passive")
     print("=" * 62)
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning")
 

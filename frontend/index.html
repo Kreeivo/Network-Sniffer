@@ -36,7 +36,7 @@
   <section class="panel" id="topology-panel">
     <div class="panel-head">
       <h2>Live network map</h2>
-      <span class="hint">line glow = data flowing right now</span>
+      <span class="hint">cyan glow = DMX / Art-Net flowing · <span class="purple">purple glow = show control (ShowKontrol, TCNet, Pro DJ Link, OSC, timecode)</span></span>
     </div>
     <svg id="topo" viewBox="0 0 900 460" preserveAspectRatio="xMidYMid meet"></svg>
   </section>
@@ -98,6 +98,32 @@
     <div class="tc-endpoints">
       <span class="tc-endpoints-label">Network-MIDI sessions announced:</span>
       <span id="midi-endpoints" class="chip-row"><span class="hint">none heard yet</span></span>
+    </div>
+  </section>
+
+  <section class="panel" id="control-panel">
+    <div class="panel-head">
+      <h2>Show control on the network</h2>
+      <span class="hint" id="control-listeners">ShowKontrol (TCNet) · Pro DJ Link · OSC — purple lines on the map are these flows</span>
+    </div>
+    <div class="control-grid">
+      <div>
+        <div class="subhead">Participants</div>
+        <div id="control-nodes" class="control-nodes">
+          <div class="empty">Nothing announced yet. ShowKontrol / TCNet nodes and Pro DJ Link players appear here as soon as they speak.</div>
+        </div>
+      </div>
+      <div>
+        <div class="subhead">Traffic — who is sending what to whom</div>
+        <table class="data-table" id="flow-table">
+          <thead>
+            <tr><th>From</th><th></th><th>To</th><th>Protocol</th><th>Message</th><th>Rate</th><th>Last content</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr class="empty-row"><td colspan="8">No show-control packets seen yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </section>
 

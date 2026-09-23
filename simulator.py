@@ -13,6 +13,9 @@ transports at once:
     python simulator.py --fps 30       # 24, 25, 30 or df (29.97 drop-frame)
     python simulator.py --fps 30 --flag 24   # lie in the rate flag, to see
                                              # the inspector detect the real rate
+    python simulator.py --show-control       # also fake a ShowKontrol rig:
+                                             # TCNet master, two CDJs + DJM on
+                                             # Pro DJ Link, and OSC cues
 
 Everything stays on this machine - Art-Net goes to 127.0.0.1 and the
 ipMIDI multicast is sent with TTL 0, which never leaves the host.
@@ -90,6 +93,80 @@ def mtc_quarter_frames(h, m, s, f):
     return [bytes([0xF1, (i << 4) | n]) for i, n in enumerate(nibbles)]
 
 
+# --- show control -----------------------------------------------------------
+
+TCNET_MAGIC = b"TCN"
+PDJL_MAGIC = bytes.fromhex("5173707431576d4a4f4c")
+
+
+def tcnet_header(msg_type, name, node_type, node_id=7):
+    return (struct.pack("<H", node_id) + bytes([3, 6]) + TCNET_MAGIC + bytes([msg_type])
+            + name.encode()[:8].ljust(8, b"\0") + bytes([1, node_type])
+            + struct.pack("<H", 0) + struct.pack("<I", int(time.time() * 1000) & 0xFFFFFFFF))
+
+
+def tcnet_optin(name, vendor, app, node_type):
+    return (tcnet_header(2, name, node_type) + struct.pack("<HHH", 2, 65032, 60) + b"\0\0"
+            + vendor.encode()[:16].ljust(16, b"\0") + app.encode()[:16].ljust(16, b"\0")
+            + bytes([3, 6, 1, 0]))
+
+
+def tcnet_time(name, layer_ms, beat):
+    pkt = bytearray(154)
+    pkt[:24] = tcnet_header(254, name, 2)
+    for i, ms in enumerate(layer_ms):
+        struct.pack_into("<I", pkt, 24 + i * 4, ms)
+        struct.pack_into("<I", pkt, 56 + i * 4, 6 * 60 * 1000)
+        pkt[88 + i] = beat if ms else 0
+        pkt[96 + i] = 1 if ms else 0          # playing / idle
+    pkt[105] = TC_RATE_CODE
+    return bytes(pkt)
+
+
+def pdjl_keepalive(name, number, mac, ip, dev_type):
+    pkt = bytearray(0x36)
+    pkt[:10] = PDJL_MAGIC
+    pkt[0x0A] = 0x06
+    pkt[0x0B:0x0B + len(name)] = name.encode()
+    pkt[0x1F] = 1
+    pkt[0x20:0x22] = b"\x00\x36"
+    pkt[0x22] = number
+    pkt[0x23:0x29] = mac
+    pkt[0x29:0x2D] = bytes(int(x) for x in ip.split("."))
+    pkt[0x2D] = 3
+    pkt[0x34] = dev_type
+    return bytes(pkt)
+
+
+def pdjl_beat(name, number, bpm, pitch_pct, beat):
+    pkt = bytearray(0x60)
+    pkt[:10] = PDJL_MAGIC
+    pkt[0x0A] = 0x28
+    pkt[0x0B:0x0B + len(name)] = name.encode()
+    pkt[0x1F] = 1
+    pkt[0x21] = number
+    pkt[0x22:0x24] = b"\x00\x3c"
+    struct.pack_into(">I", pkt, 0x54, int(0x100000 * (1 + pitch_pct / 100.0)))
+    struct.pack_into(">H", pkt, 0x5A, int(bpm * 100))
+    pkt[0x5C] = beat
+    pkt[0x5F] = number
+    return bytes(pkt)
+
+
+def osc(address, *args):
+    def pad(b):
+        return b + b"\0" * (4 - len(b) % 4)
+    tags, body = b",", b""
+    for a in args:
+        if isinstance(a, int):
+            tags += b"i"; body += struct.pack(">i", a)
+        elif isinstance(a, float):
+            tags += b"f"; body += struct.pack(">f", a)
+        else:
+            tags += b"s"; body += pad(str(a).encode())
+    return pad(address.encode()) + pad(tags) + body
+
+
 def main():
     global TC_FPS, TC_NOMINAL, TC_RATE_CODE, TC_DROP
     ap = argparse.ArgumentParser(description="Art-Net + MTC simulator")
@@ -97,6 +174,8 @@ def main():
                     help="timecode rate: 24, 25, 30 or df (29.97 drop-frame)")
     ap.add_argument("--flag", choices=sorted(RATES), default=None,
                     help="put a different rate in the MTC rate flag (to test detection)")
+    ap.add_argument("--show-control", action="store_true",
+                    help="also fake a ShowKontrol rig (TCNet, Pro DJ Link, OSC)")
     a = ap.parse_args()
     TC_FPS, TC_NOMINAL, TC_RATE_CODE = RATES[a.fps]
     TC_DROP = a.fps == "df"
@@ -118,8 +197,28 @@ def main():
           f"{a.fps.replace('df', '29.97 drop')} fps"
           + (f" (flagged as {a.flag.replace('df', '29.97 drop')})" if a.flag else "") + ".")
     print("Ctrl+C to stop.")
+    def from_ip(last_octet):
+        """A sender bound to 127.0.0.N so each fake device has its own address
+        (Linux/Windows allow any 127/8 address; elsewhere fall back to default)."""
+        so = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            so.bind((f"127.0.0.{last_octet}", 0))
+        except OSError:
+            pass
+        return so
+
+    if a.show_control:
+        sk, desk = from_ip(10), from_ip(11)
+        cdj1, cdj2, djm = from_ip(21), from_ip(22), from_ip(33)
+        print("Show control: TCNet master 'SHOWKTRL' (127.0.0.10) and grandMA3 slave "
+              "(127.0.0.11); CDJ-3000 #1/#2 + DJM-900NXS2 on Pro DJ Link "
+              "(127.0.0.21/22/33); OSC cues from SHOWKTRL to :7000 - all to 127.0.0.1.")
     seq = 0
     last_reply = 0.0
+    sc_last = {"optin": 0.0, "keepalive": 0.0, "beat": 0.0, "osc": 0.0, "time": 0.0}
+    sc_beat, sc_cue = 0, 0
+    bpm = 128.0
+    beat_period = 60.0 / bpm
     h, m, sec, f = TC_START
     tc_frame = ((h * 60 + m) * 60 + sec) * TC_NOMINAL + f
     tc_next = time.time()
@@ -149,6 +248,33 @@ def main():
                 qf_index = (qf_index + 4) % 8
                 tc_frame += 1
                 tc_next += 1 / TC_FPS
+            if a.show_control:
+                lo = ("127.0.0.1", 0)
+                if t - sc_last["optin"] > 1.0:
+                    sk.sendto(tcnet_optin("SHOWKTRL", "TC Supply", "ShowKontrol", 2), ("127.0.0.1", 60000))
+                    desk.sendto(tcnet_optin("LX-DESK", "MA Lighting", "grandMA3", 4), ("127.0.0.1", 60000))
+                    sc_last["optin"] = t
+                if t - sc_last["keepalive"] > 1.5:
+                    for so, name, num, mac, ip, dtype in (
+                            (cdj1, "CDJ-3000", 1, b"\xc8\x2b\x96\x00\x00\x01", "127.0.0.21", 1),
+                            (cdj2, "CDJ-3000", 2, b"\xc8\x2b\x96\x00\x00\x02", "127.0.0.22", 1),
+                            (djm, "DJM-900NXS2", 0x21, b"\xc8\x2b\x96\x00\x00\x21", "127.0.0.33", 2)):
+                        so.sendto(pdjl_keepalive(name, num, mac, ip, dtype), ("127.0.0.1", 50000))
+                    sc_last["keepalive"] = t
+                if t - sc_last["beat"] > beat_period:
+                    sc_beat = sc_beat % 4 + 1
+                    cdj1.sendto(pdjl_beat("CDJ-3000", 1, bpm, 0.0, sc_beat), ("127.0.0.1", 50001))
+                    cdj2.sendto(pdjl_beat("CDJ-3000", 2, 126.0, 1.59, (sc_beat + 1) % 4 + 1), ("127.0.0.1", 50001))
+                    sc_last["beat"] = t
+                if t - sc_last["time"] > 1 / 30:
+                    ms = int((tc_frame / TC_NOMINAL) * 1000)
+                    sk.sendto(tcnet_time("SHOWKTRL", [ms, ms - 30000, 0, 0, 0, 0, 0, 0], sc_beat), ("127.0.0.1", 60001))
+                    sc_last["time"] = t
+                if t - sc_last["osc"] > 2.0:
+                    sc_cue += 1
+                    sk.sendto(osc("/cmd", f"Go+ Sequence {sc_cue}"), ("127.0.0.1", 7000))
+                    sk.sendto(osc("/composition/layers/1/clips/%d/connect" % (sc_cue % 4 + 1), 1), ("127.0.0.1", 7000))
+                    sc_last["osc"] = t
             time.sleep(1 / 40)
     except KeyboardInterrupt:
         print("\nSimulator stopped.")

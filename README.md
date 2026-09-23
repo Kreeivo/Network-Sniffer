@@ -20,8 +20,15 @@ where it's coming from.
   lost. Covers Art-Net timecode (ArtTimeCode), ipMIDI multicast and,
   optionally, RTP-MIDI/AppleMIDI; network-MIDI sessions announced over
   mDNS are listed by name.
+- **Show control visibility (ShowKontrol, TCNet, Pro DJ Link, OSC)** —
+  every show-control participant that announces itself, and every stream
+  of show-control packets with where it comes *from* and where it goes
+  *to*, decoded: TCNet nodes with vendor/app/version and master/slave
+  role, the master's running layer times; Pro DJ Link players and mixers
+  with BPM, pitch and beat; OSC addresses and arguments.
 - **Live network map** — this computer → switch → every device, with lines
-  that animate while data is actually flowing on that link.
+  that animate while data is actually flowing on that link — cyan for
+  DMX, purple for show control.
 - **Other LAN devices** — a best-effort ping + ARP scan surfaces
   non-Art-Net gear (show-control PCs, media servers, managed switches)
   with hostname and vendor where available.
@@ -108,7 +115,10 @@ DMX at 40 fps, and the timecode panel starts rolling at 25 fps from two
 transports at once (Art-Net timecode and ipMIDI bus 1). `--fps 24`, `30`
 or `df` (29.97 drop-frame) changes the rate, and `--flag 24` makes the
 simulator lie in its rate flag so you can watch the inspector work out
-the real one. Everything stays
+the real one. `--show-control` adds a fake ShowKontrol rig — a TCNet
+master and a grandMA3 slave, two CDJ-3000s and a DJM on Pro DJ Link, and
+OSC cues — each from its own 127.0.0.x address, so the show-control
+panel and the purple lines on the map light up too. Everything stays
 on this machine — the Art-Net goes to 127.0.0.1 and the ipMIDI multicast
 is sent with TTL 0, so nothing touches your real network. Ctrl+C to stop.
 
@@ -126,6 +136,9 @@ python app.py --ipmidi-buses 8   # watch ipMIDI buses 1-8 (default 1-4)
 python app.py --rtp-midi         # also listen on RTP-MIDI ports 5004/5005
 python app.py --no-mdns          # don't listen for network-MIDI announcements
 python app.py --no-mtc           # turn the timecode listeners off entirely
+python app.py --osc-ports 8000,9001   # OSC ports to watch (default 7000,7001,8000,9000,53000; 'none' to skip)
+python app.py --no-tcnet         # don't listen for TCNet / ShowKontrol
+python app.py --no-pro-dj-link   # don't listen for Pioneer Pro DJ Link
 ```
 
 ---
@@ -187,6 +200,20 @@ python app.py --no-mtc           # turn the timecode listeners off entirely
   sessions that have announced themselves over mDNS, by their session
   name — useful for confirming a Mac or a MIDI-over-Ethernet box is on
   the network even before it starts sending timecode.
+- **Show control on the network** — the left side lists every
+  participant that has announced itself: TCNet nodes (ShowKontrol shows
+  up here as a TCNet *Master* with its vendor, app and version; consoles
+  and media servers that speak TCNet appear as *Slaves*) with the
+  master's layers and their running times, and Pro DJ Link gear (CDJs,
+  the DJM, rekordbox) with device number, MAC, and live BPM / pitch /
+  beat-in-bar. The right side is the traffic: each row is one stream
+  from a source to a destination — *everyone* (broadcast), a multicast
+  group, *this computer*, or a specific device — with the protocol,
+  message type (or OSC address), rate and the last decoded content. On
+  the map, every device that is sending show control right now gets a
+  **purple glowing line**, the hub glows purple while anything is being
+  broadcast, and a unicast stream between two devices on the map is
+  drawn as a direct purple line between them.
 - **DMX universes on the wire** — every universe currently being
   transmitted, who is sending it, at what frame rate (consoles typically
   sit around 30–44 fps), how many of its channels are above zero, and its
@@ -207,6 +234,21 @@ python app.py --no-mtc           # turn the timecode listeners off entirely
 - **ShowKontrol / other protocols:** if it speaks Art-Net it'll appear
   with full detail; otherwise it appears in "Other devices" from the LAN
   scan with its hostname.
+- **What show-control traffic is visible:** ShowKontrol's own protocol,
+  TCNet, is broadcast (OptIn on UDP 60000, the master's Time on 60001),
+  and so is Pro DJ Link (keep-alives on 50000, beats on 50001), so this
+  machine sees all of it through any switch. TCNet's unicast Data
+  packets, and OSC / UDP commands sent point-to-point from ShowKontrol
+  to a console, are only visible when they are aimed at this machine or
+  at broadcast — that's the same physics as unicast DMX. The OSC ports
+  are opened without sharing, so if a console or media server on this PC
+  already owns one it is simply skipped (the startup banner says so).
+  The "to" address is read straight off each packet on Linux and macOS;
+  Windows can't report it, so there the destination reads "this
+  computer / broadcast". TCNet layer decoding covers the fields TC Supply
+  documents publicly (running time, state, beat, SMPTE mode); anything
+  beyond that is shown as raw message types and counts rather than
+  guessed at.
 - **Which timecode transports are visible:** Art-Net timecode is broadcast
   and ipMIDI is multicast, so this machine sees both through any switch
   with nothing to configure. RTP-MIDI (Apple Network MIDI, most
